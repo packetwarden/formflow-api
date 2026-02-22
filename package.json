@@ -1,0 +1,23 @@
+{
+    "name": "formflow-api",
+    "version": "1.0.0",
+    "private": true,
+    "description": "FormSandbox Backend API using Cloudflare Workers and Hono",
+    "main": "src/index.ts",
+    "scripts": {
+        "dev": "wrangler dev",
+        "deploy": "wrangler deploy",
+        "cf-typegen": "wrangler types"
+    },
+    "dependencies": {
+        "hono": "^4.0.0",
+        "zod": "^3.0.0",
+        "@hono/zod-validator": "^0.2.0",
+        "@supabase/supabase-js": "^2.0.0"
+    },
+    "devDependencies": {
+        "@cloudflare/workers-types": "^4.20250214.0",
+        "typescript": "^5.0.0",
+        "wrangler": "^3.100.0"
+    }
+}
