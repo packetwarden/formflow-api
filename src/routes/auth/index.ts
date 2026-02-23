@@ -1,6 +1,6 @@
 import { Hono } from 'hono'
 import { zValidator } from '@hono/zod-validator'
-import { Env, Variables } from '../types'
+import { Env, Variables } from '../../types'
 import { getSupabaseClient } from '../../db/supabase'
 import { signUpSchema, loginSchema } from '../../utils/validation'
 import { requireAuth } from '../../middlewares/auth'
