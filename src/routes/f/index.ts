@@ -1021,40 +1021,44 @@ const sanitizeAndValidateData = (
     }
 }
 
-const parseRateLimitError = (error: { message: string; details: string | null; code: string | null }) => {
-    const parsedMessage =
-        typeof error.message === 'string' && error.message.trim().startsWith('{')
-            ? (() => {
-                try {
-                    return JSON.parse(error.message)
-                } catch {
-                    return null
-                }
-            })()
-            : null
+const parseRateLimitError = (error: unknown) => {
+    const errorRecord = isRecord(error) ? error : {}
+    const rawMessage = typeof errorRecord.message === 'string' ? errorRecord.message : null
+    const rawDetails = typeof errorRecord.details === 'string' ? errorRecord.details : null
+    const rawCode = typeof errorRecord.code === 'string' ? errorRecord.code : null
 
-    const parsedDetails =
-        typeof error.details === 'string' && error.details.trim().startsWith('{')
-            ? (() => {
-                try {
-                    return JSON.parse(error.details)
-                } catch {
-                    return null
-                }
-            })()
-            : null
+    const parseJsonObject = (value: string | null) => {
+        if (!value || !value.trim().startsWith('{')) return null
 
-    if (parsedDetails?.status === 429) {
+        try {
+            const parsed = JSON.parse(value)
+            return isRecord(parsed) ? parsed : null
+        } catch {
+            return null
+        }
+    }
+
+    const parsedMessage = parseJsonObject(rawMessage)
+    const parsedDetails = parseJsonObject(rawDetails)
+    const parsedStatus = parsedDetails?.status
+
+    if (parsedStatus === 429 || rawCode === '429') {
         return {
             status: 429 as const,
             payload: {
-                error: parsedMessage?.message ?? 'Too many requests. Please try again later.',
-                code: parsedMessage?.code ?? 'RATE_LIMITED',
+                error:
+                    typeof parsedMessage?.message === 'string'
+                        ? parsedMessage.message
+                        : 'Too many requests. Please try again later.',
+                code:
+                    typeof parsedMessage?.code === 'string'
+                        ? parsedMessage.code
+                        : 'RATE_LIMITED',
             },
         }
     }
 
-    if (error.message.includes('RATE_LIMITED')) {
+    if (typeof rawMessage === 'string' && rawMessage.includes('RATE_LIMITED')) {
         return {
             status: 429 as const,
             payload: {
@@ -1130,145 +1134,150 @@ runnerRouter.post(
     zValidator('param', runnerFormParamSchema),
     zValidator('json', runnerSubmitBodySchema),
     async (c) => {
-        const { formId } = c.req.valid('param')
-        const { data, started_at } = c.req.valid('json')
+        try {
+            const { formId } = c.req.valid('param')
+            const { data, started_at } = c.req.valid('json')
 
-        const headerValidation = runnerIdempotencyHeaderSchema.safeParse({
-            'idempotency-key': c.req.header('idempotency-key') ?? c.req.header('Idempotency-Key'),
-        })
+            const headerValidation = runnerIdempotencyHeaderSchema.safeParse({
+                'idempotency-key': c.req.header('idempotency-key') ?? c.req.header('Idempotency-Key'),
+            })
 
-        if (!headerValidation.success) {
-            return c.json({
-                error: 'Invalid idempotency header',
-                code: 'FIELD_VALIDATION_FAILED',
-                issues: headerValidation.error.issues.map((issue) => ({
-                    field_id: 'Idempotency-Key',
-                    message: issue.message,
-                })),
-            }, 400)
-        }
-
-        const idempotencyKey = headerValidation.data['idempotency-key']
-        const supabase = getRunnerSupabaseClient(c)
-
-        const { error: rateLimitError } = await supabase.rpc('check_request')
-        if (rateLimitError) {
-            const mappedRateLimit = parseRateLimitError(rateLimitError)
-            if (mappedRateLimit) {
-                return c.json(mappedRateLimit.payload, mappedRateLimit.status)
+            if (!headerValidation.success) {
+                return c.json({
+                    error: 'Invalid idempotency header',
+                    code: 'FIELD_VALIDATION_FAILED',
+                    issues: headerValidation.error.issues.map((issue) => ({
+                        field_id: 'Idempotency-Key',
+                        message: issue.message,
+                    })),
+                }, 400)
             }
 
-            console.error('Runner rate-limit check error:', rateLimitError)
-            return c.json({ error: 'Failed to evaluate rate limit' }, 500)
-        }
+            const idempotencyKey = headerValidation.data['idempotency-key']
+            const supabase = getRunnerSupabaseClient(c)
 
-        const { data: formRows, error: formError } = await supabase.rpc('get_published_form_by_id', {
-            p_form_id: formId,
-        })
+            const { error: rateLimitError } = await supabase.rpc('check_request')
+            if (rateLimitError) {
+                const mappedRateLimit = parseRateLimitError(rateLimitError)
+                if (mappedRateLimit) {
+                    return c.json(mappedRateLimit.payload, mappedRateLimit.status)
+                }
 
-        if (formError) {
-            console.error('Runner form lookup error:', formError)
-            return c.json({ error: 'Failed to fetch form' }, 500)
-        }
+                console.error('Runner rate-limit check error:', rateLimitError)
+                return c.json({ error: 'Failed to evaluate rate limit' }, 500)
+            }
 
-        const form = (Array.isArray(formRows) ? formRows[0] : null) as PublishedFormRow | null
-        if (!form) {
-            return c.json({ error: 'Form not found' }, 404)
-        }
+            const { data: formRows, error: formError } = await supabase.rpc('get_published_form_by_id', {
+                p_form_id: formId,
+            })
 
-        const contractResult = parsePublishedContract(form.published_schema)
-        if (!contractResult.ok) {
-            return c.json({
-                error: 'Unsupported form schema',
-                code: 'UNSUPPORTED_FORM_SCHEMA',
-                issues: contractResult.issues,
-            }, 422)
-        }
+            if (formError) {
+                console.error('Runner form lookup error:', formError)
+                return c.json({ error: 'Failed to fetch form' }, 500)
+            }
 
-        const payloadResult = sanitizeAndValidateData(contractResult.contract, data)
-        if (!payloadResult.ok) {
-            return c.json(payloadResult.payload, 422)
-        }
-
-        const { data: quotaRows, error: quotaError } = await supabase.rpc('get_form_submission_quota', {
-            p_form_id: formId,
-        })
-
-        if (quotaError) {
-            if (quotaError.code === 'P0002') {
+            const form = (Array.isArray(formRows) ? formRows[0] : null) as PublishedFormRow | null
+            if (!form) {
                 return c.json({ error: 'Form not found' }, 404)
             }
 
-            console.error('Runner quota check error:', quotaError)
-            return c.json({ error: 'Failed to evaluate submission quota' }, 500)
-        }
-
-        const quota = (Array.isArray(quotaRows) ? quotaRows[0] : null) as QuotaRow | null
-        if (!quota) {
-            console.error('Runner quota check returned no row')
-            return c.json({ error: 'Failed to evaluate submission quota' }, 500)
-        }
-
-        const currentUsage = Number(quota.current_usage ?? 0)
-        const limitValue = quota.limit_value
-
-        if (!quota.is_enabled) {
-            return c.json({
-                error: 'Feature disabled for current plan',
-                code: 'PLAN_FEATURE_DISABLED',
-                feature: 'max_submissions_monthly',
-                current: currentUsage,
-                allowed: limitValue,
-                upgrade_url: '/pricing',
-            }, 403)
-        }
-
-        if (typeof limitValue === 'number' && limitValue >= 0 && currentUsage >= limitValue) {
-            return c.json({
-                error: 'Submission quota exceeded',
-                code: 'PLAN_LIMIT_EXCEEDED',
-                feature: 'max_submissions_monthly',
-                current: currentUsage,
-                allowed: limitValue,
-                upgrade_url: '/pricing',
-            }, 403)
-        }
-
-        const clientIp = extractClientIp(c)
-        const userAgent = c.req.header('user-agent')
-        const referer = c.req.header('referer')
-
-        const { data: submissionId, error: submitError } = await supabase.rpc('submit_form', {
-            p_form_id: formId,
-            p_data: payloadResult.sanitizedData,
-            p_idempotency_key: idempotencyKey,
-            p_ip_address: clientIp,
-            p_user_agent: userAgent ?? null,
-            p_referrer: referer ?? null,
-            p_started_at: started_at ?? null,
-        })
-
-        if (submitError) {
-            const mappedError = parseSubmissionRpcError(submitError)
-            if (mappedError) {
-                return c.json(mappedError.payload, mappedError.status)
+            const contractResult = parsePublishedContract(form.published_schema)
+            if (!contractResult.ok) {
+                return c.json({
+                    error: 'Unsupported form schema',
+                    code: 'UNSUPPORTED_FORM_SCHEMA',
+                    issues: contractResult.issues,
+                }, 422)
             }
 
-            console.error('Runner submission error:', submitError)
-            return c.json({ error: 'Failed to submit form' }, 500)
-        }
+            const payloadResult = sanitizeAndValidateData(contractResult.contract, data)
+            if (!payloadResult.ok) {
+                return c.json(payloadResult.payload, 422)
+            }
 
-        if (!submissionId || typeof submissionId !== 'string') {
-            return c.json({ error: 'Failed to resolve submission ID' }, 500)
-        }
+            const { data: quotaRows, error: quotaError } = await supabase.rpc('get_form_submission_quota', {
+                p_form_id: formId,
+            })
 
-        const response: RunnerSubmitSuccessResponse = {
-            submission_id: submissionId,
-            success_message: form.success_message ?? null,
-            redirect_url: form.redirect_url ?? null,
-        }
+            if (quotaError) {
+                if (quotaError.code === 'P0002') {
+                    return c.json({ error: 'Form not found' }, 404)
+                }
 
-        return c.json(response, 201)
+                console.error('Runner quota check error:', quotaError)
+                return c.json({ error: 'Failed to evaluate submission quota' }, 500)
+            }
+
+            const quota = (Array.isArray(quotaRows) ? quotaRows[0] : null) as QuotaRow | null
+            if (!quota) {
+                console.error('Runner quota check returned no row')
+                return c.json({ error: 'Failed to evaluate submission quota' }, 500)
+            }
+
+            const currentUsage = Number(quota.current_usage ?? 0)
+            const limitValue = quota.limit_value
+
+            if (!quota.is_enabled) {
+                return c.json({
+                    error: 'Feature disabled for current plan',
+                    code: 'PLAN_FEATURE_DISABLED',
+                    feature: 'max_submissions_monthly',
+                    current: currentUsage,
+                    allowed: limitValue,
+                    upgrade_url: '/pricing',
+                }, 403)
+            }
+
+            if (typeof limitValue === 'number' && limitValue >= 0 && currentUsage >= limitValue) {
+                return c.json({
+                    error: 'Submission quota exceeded',
+                    code: 'PLAN_LIMIT_EXCEEDED',
+                    feature: 'max_submissions_monthly',
+                    current: currentUsage,
+                    allowed: limitValue,
+                    upgrade_url: '/pricing',
+                }, 403)
+            }
+
+            const clientIp = extractClientIp(c)
+            const userAgent = c.req.header('user-agent')
+            const referer = c.req.header('referer')
+
+            const { data: submissionId, error: submitError } = await supabase.rpc('submit_form', {
+                p_form_id: formId,
+                p_data: payloadResult.sanitizedData,
+                p_idempotency_key: idempotencyKey,
+                p_ip_address: clientIp,
+                p_user_agent: userAgent ?? null,
+                p_referrer: referer ?? null,
+                p_started_at: started_at ?? null,
+            })
+
+            if (submitError) {
+                const mappedError = parseSubmissionRpcError(submitError)
+                if (mappedError) {
+                    return c.json(mappedError.payload, mappedError.status)
+                }
+
+                console.error('Runner submission error:', submitError)
+                return c.json({ error: 'Failed to submit form' }, 500)
+            }
+
+            if (!submissionId || typeof submissionId !== 'string') {
+                return c.json({ error: 'Failed to resolve submission ID' }, 500)
+            }
+
+            const response: RunnerSubmitSuccessResponse = {
+                submission_id: submissionId,
+                success_message: form.success_message ?? null,
+                redirect_url: form.redirect_url ?? null,
+            }
+
+            return c.json(response, 201)
+        } catch (error) {
+            console.error('Runner submit unhandled error:', error)
+            return c.json({ error: 'Failed to submit form', code: 'RUNNER_INTERNAL_ERROR' }, 500)
+        }
     }
 )
 

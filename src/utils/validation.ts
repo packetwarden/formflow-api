@@ -23,7 +23,7 @@ export const buildParamSchema = workspaceParamSchema.merge(formParamSchema);
 export const runnerFormParamSchema = formParamSchema;
 
 export const runnerSubmitBodySchema = z.object({
-    data: z.record(z.unknown()),
+    data: z.record(z.string(), z.unknown()),
     started_at: z
         .string()
         .datetime({ offset: true, message: 'started_at must be a valid ISO datetime string with offset' })
@@ -36,10 +36,10 @@ export const runnerIdempotencyHeaderSchema = z.object({
 
 export const draftSchemaShape = z.object({
     layout: z.unknown(),
-    theme: z.record(z.unknown()),
+    theme: z.record(z.string(), z.unknown()),
     steps: z.array(z.unknown()),
     logic: z.array(z.unknown()),
-    settings: z.record(z.unknown()),
+    settings: z.record(z.string(), z.unknown()),
 }).passthrough();
 
 export const updateDraftSchema = z.object({
