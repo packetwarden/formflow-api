@@ -7,14 +7,25 @@ import { createClient, SupabaseClient } from '@supabase/supabase-js'
  * 
  * @param supabaseUrl The Supabase project URL
  * @param supabaseKey The Supabase Anon Key (for client auth) or Service Role Key (for admin tasks)
+ * @param accessToken Optional JWT used to propagate request-scoped auth context for RLS
  * @returns An edge-ready Supabase Client
  */
-export const getSupabaseClient = (supabaseUrl: string, supabaseKey: string): SupabaseClient => {
-    return createClient(supabaseUrl, supabaseKey, {
+export const getSupabaseClient = (supabaseUrl: string, supabaseKey: string, accessToken?: string): SupabaseClient => {
+    const options: Parameters<typeof createClient>[2] = {
         auth: {
             autoRefreshToken: false,
             persistSession: false,
             detectSessionInUrl: false
         }
-    })
+    }
+
+    if (accessToken) {
+        options.global = {
+            headers: {
+                Authorization: `Bearer ${accessToken}`
+            }
+        }
+    }
+
+    return createClient(supabaseUrl, supabaseKey, options)
 }

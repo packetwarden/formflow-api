@@ -14,7 +14,11 @@ export const requireAuth = async (c: Context<{ Bindings: Env; Variables: Variabl
         return c.json({ error: 'Unauthorized: Missing or invalid Authorization header' }, 401)
     }
 
-    const token = authHeader.split(' ')[1]
+    const token = authHeader.split(' ')[1]?.trim()
+
+    if (!token) {
+        return c.json({ error: 'Unauthorized: Missing token' }, 401)
+    }
 
     try {
         // We instantiate the client solely for verification.
@@ -30,6 +34,7 @@ export const requireAuth = async (c: Context<{ Bindings: Env; Variables: Variabl
 
         // Attach user to context for downstream route handlers
         c.set('user', user)
+        c.set('accessToken', token)
 
         await next()
     } catch (err) {
