@@ -10,7 +10,11 @@ import stripeRouter from './routes/stripe'
 
 const app = new Hono<{ Bindings: Env }>()
 
-app.use('*', logger())
+app.use('*', logger((message: string, ...rest: string[]) => {
+    // Strip ANSI color codes from the message
+    const cleanMessage = message.replace(/\x1b\[[0-9;]*m/g, '')
+    console.log(cleanMessage, ...rest)
+}))
 app.use('*', cors())
 
 // API Routing Strategy
