@@ -4,6 +4,7 @@ import { Env, Variables } from '../../types'
 import { getSupabaseClient } from '../../db/supabase'
 import { signUpSchema, loginSchema } from '../../utils/validation'
 import { requireAuth } from '../../middlewares/auth'
+import { authPublicWriteRateLimit, authUserWriteRateLimit } from '../../middlewares/rate-limit'
 
 const authRouter = new Hono<{ Bindings: Env; Variables: Variables }>()
 
@@ -11,7 +12,7 @@ const authRouter = new Hono<{ Bindings: Env; Variables: Variables }>()
  * POST /api/v1/auth/signup
  * Registers a new user via Supabase Auth.
  */
-authRouter.post('/signup', zValidator('json', signUpSchema), async (c) => {
+authRouter.post('/signup', authPublicWriteRateLimit, zValidator('json', signUpSchema), async (c) => {
     const { email, password, full_name } = c.req.valid('json')
     const supabase = getSupabaseClient(c.env.SUPABASE_URL, c.env.SUPABASE_ANON_KEY)
 
@@ -36,7 +37,7 @@ authRouter.post('/signup', zValidator('json', signUpSchema), async (c) => {
  * POST /api/v1/auth/login
  * Authenticates a user and returns their session (access token + refresh token).
  */
-authRouter.post('/login', zValidator('json', loginSchema), async (c) => {
+authRouter.post('/login', authPublicWriteRateLimit, zValidator('json', loginSchema), async (c) => {
     const { email, password } = c.req.valid('json')
     const supabase = getSupabaseClient(c.env.SUPABASE_URL, c.env.SUPABASE_ANON_KEY)
 
@@ -57,7 +58,7 @@ authRouter.post('/login', zValidator('json', loginSchema), async (c) => {
  * Logs out the user and invalidates the session globally.
  * Requires Authentication.
  */
-authRouter.post('/logout', requireAuth, async (c) => {
+authRouter.post('/logout', requireAuth, authUserWriteRateLimit, async (c) => {
     // Extract token to sign out explicitly if needed, but the edge client handles scope
     // If we wanted to ensure the token from headers is invalidated we'd need admin client
     // But standard signout works within the context if we pass the token, however edge

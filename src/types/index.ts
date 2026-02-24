@@ -4,6 +4,9 @@ export interface Env {
     SUPABASE_URL: string;
     SUPABASE_SERVICE_ROLE_KEY: string;
     SUPABASE_ANON_KEY: string;
+    RUNNER_WRITE_RATE_LIMITER: RateLimit;
+    AUTH_WRITE_RATE_LIMITER: RateLimit;
+    BUILD_WRITE_RATE_LIMITER: RateLimit;
 }
 
 export interface Variables {

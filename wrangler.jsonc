@@ -2,9 +2,35 @@
 {
     "name": "formflow-api",
     "main": "src/index.ts",
-    "compatibility_date": "2025-03-07",
+    "compatibility_date": "2026-02-24",
     "compatibility_flags": [
         "nodejs_compat"
+    ],
+    "ratelimits": [
+        {
+            "name": "RUNNER_WRITE_RATE_LIMITER",
+            "namespace_id": "21001",
+            "simple": {
+                "limit": 2,
+                "period": 60
+            }
+        },
+        {
+            "name": "AUTH_WRITE_RATE_LIMITER",
+            "namespace_id": "21002",
+            "simple": {
+                "limit": 2,
+                "period": 60
+            }
+        },
+        {
+            "name": "BUILD_WRITE_RATE_LIMITER",
+            "namespace_id": "21003",
+            "simple": {
+                "limit": 2,
+                "period": 60
+            }
+        }
     ],
     "observability": {
         "enabled": true,

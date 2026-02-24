@@ -3,6 +3,7 @@ import type { Context } from 'hono'
 import { zValidator } from '@hono/zod-validator'
 import type { Env, Variables } from '../../types'
 import { requireAuth } from '../../middlewares/auth'
+import { buildWriteRateLimit } from '../../middlewares/rate-limit'
 import { getSupabaseClient } from '../../db/supabase'
 import {
     buildParamSchema,
@@ -46,6 +47,7 @@ const formSummarySelect = [
 const formDetailSelect = `${formSummarySelect}, schema`
 
 buildRouter.use('*', requireAuth)
+buildRouter.use('*', buildWriteRateLimit)
 
 const getScopedSupabaseClient = (c: BuildContext) => {
     return getSupabaseClient(

@@ -2,6 +2,7 @@ import { Hono } from 'hono'
 import type { Context } from 'hono'
 import { zValidator } from '@hono/zod-validator'
 import { getSupabaseClient } from '../../db/supabase'
+import { runnerWriteRateLimit } from '../../middlewares/rate-limit'
 import type { Env, RunnerSubmitSuccessResponse } from '../../types'
 import {
     runnerFormParamSchema,
@@ -1021,56 +1022,6 @@ const sanitizeAndValidateData = (
     }
 }
 
-const parseRateLimitError = (error: unknown) => {
-    const errorRecord = isRecord(error) ? error : {}
-    const rawMessage = typeof errorRecord.message === 'string' ? errorRecord.message : null
-    const rawDetails = typeof errorRecord.details === 'string' ? errorRecord.details : null
-    const rawCode = typeof errorRecord.code === 'string' ? errorRecord.code : null
-
-    const parseJsonObject = (value: string | null) => {
-        if (!value || !value.trim().startsWith('{')) return null
-
-        try {
-            const parsed = JSON.parse(value)
-            return isRecord(parsed) ? parsed : null
-        } catch {
-            return null
-        }
-    }
-
-    const parsedMessage = parseJsonObject(rawMessage)
-    const parsedDetails = parseJsonObject(rawDetails)
-    const parsedStatus = parsedDetails?.status
-
-    if (parsedStatus === 429 || rawCode === '429') {
-        return {
-            status: 429 as const,
-            payload: {
-                error:
-                    typeof parsedMessage?.message === 'string'
-                        ? parsedMessage.message
-                        : 'Too many requests. Please try again later.',
-                code:
-                    typeof parsedMessage?.code === 'string'
-                        ? parsedMessage.code
-                        : 'RATE_LIMITED',
-            },
-        }
-    }
-
-    if (typeof rawMessage === 'string' && rawMessage.includes('RATE_LIMITED')) {
-        return {
-            status: 429 as const,
-            payload: {
-                error: 'Too many requests. Please try again later.',
-                code: 'RATE_LIMITED',
-            },
-        }
-    }
-
-    return null
-}
-
 const parseSubmissionRpcError = (error: { code: string | null; message: string }) => {
     if (error.code === 'P0002') return { status: 404 as const, payload: { error: 'Form not found' } }
     if (error.code === '42501') return { status: 403 as const, payload: { error: 'Forbidden' } }
@@ -1131,6 +1082,7 @@ runnerRouter.get(
 
 runnerRouter.post(
     '/:formId/submit',
+    runnerWriteRateLimit,
     zValidator('param', runnerFormParamSchema),
     zValidator('json', runnerSubmitBodySchema),
     async (c) => {
@@ -1155,17 +1107,6 @@ runnerRouter.post(
 
             const idempotencyKey = headerValidation.data['idempotency-key']
             const supabase = getRunnerSupabaseClient(c)
-
-            const { error: rateLimitError } = await supabase.rpc('check_request')
-            if (rateLimitError) {
-                const mappedRateLimit = parseRateLimitError(rateLimitError)
-                if (mappedRateLimit) {
-                    return c.json(mappedRateLimit.payload, mappedRateLimit.status)
-                }
-
-                console.error('Runner rate-limit check error:', rateLimitError)
-                return c.json({ error: 'Failed to evaluate rate limit' }, 500)
-            }
 
             const { data: formRows, error: formError } = await supabase.rpc('get_published_form_by_id', {
                 p_form_id: formId,
