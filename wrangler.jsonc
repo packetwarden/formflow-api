@@ -2,7 +2,7 @@
 {
     "name": "formflow-api",
     "main": "src/index.ts",
-    "compatibility_date": "2026-02-24",
+    "compatibility_date": "2026-02-25",
     "compatibility_flags": [
         "nodejs_compat"
     ],
@@ -24,6 +24,12 @@
             }
         }
     ],
+    "triggers": {
+        "crons": [
+            "*/5 * * * *",
+            "0 * * * *"
+        ]
+    },
     "observability": {
         "enabled": true,
         "head_sampling_rate": 1

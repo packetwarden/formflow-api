@@ -42,3 +42,10 @@ export const getSupabaseClient = (
 
     return createClient(supabaseUrl, supabaseKey, options)
 }
+
+export const getServiceRoleSupabaseClient = (
+    supabaseUrl: string,
+    serviceRoleKey: string
+): SupabaseClient => {
+    return getSupabaseClient(supabaseUrl, serviceRoleKey)
+}

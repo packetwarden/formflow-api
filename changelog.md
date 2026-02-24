@@ -9,6 +9,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 ## [Unreleased]
 
 ### Added
+- **Stripe Hosted Billing v1**: Implemented `/api/v1/stripe/workspaces/:workspaceId/checkout-session`, `/portal-session`, and `/webhook` in `src/routes/stripe/index.ts` with owner/admin gating, hosted checkout, and customer portal support.
+- **Stripe Webhook Idempotency + Async Processing**: Added verified webhook ingestion (`constructEventAsync`) with idempotent event storage in `stripe_webhook_events` and async event processing status transitions (`pending` -> `processing` -> `completed|failed`).
+- **Stripe Retry + Grace Scheduler**: Added scheduled handlers (cron) for webhook replay (`*/5 * * * *`) and grace-period downgrade enforcement (`0 * * * *`) through `runStripeScheduled`.
+- **Stripe Migration + Implementation Docs**: Added `project-info-docs/migrations/2026-02-24_stripe_checkout_portal_v1.sql` and `project-info-docs/stripe-implementation.md`.
+- **Shared Workspace Role Guard Utility**: Added `src/utils/workspace-access.ts` and reused it in build + stripe routes to centralize workspace access/role enforcement.
+- **Stripe Environment Bindings**: Added Stripe + service-role env bindings to `src/types/index.ts` and checkout validation schema in `src/utils/validation.ts`.
 - **Runner API v1 (Beta-Complete)**: Implemented public runner endpoints in `src/routes/f/index.ts` with `GET /api/v1/f/:formId/schema` and `POST /api/v1/f/:formId/submit` using UUID form lookup.
 - **Strict Fail-Closed Dynamic Validation**: Added schema-derived field validation for public submissions with fail-closed behavior on unsupported field types, validation keys, and logic rule/operator/action shapes (`422 UNSUPPORTED_FORM_SCHEMA` / `FIELD_VALIDATION_FAILED`).
 - **Logic-Aware Payload Sanitization**: Added heuristic logic evaluator for show/hide rules with alias support and hidden-field stripping before submission persistence.
@@ -16,7 +22,6 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 - **Runner Entitlement Enforcement**: Added `max_submissions_monthly` quota checks for runner submissions via `get_form_submission_quota`.
 - **Worker-Native Rate Limiting (Auth/Build)**: Added Cloudflare `ratelimits` bindings and reusable middleware for write-method (`POST|PUT|PATCH|DELETE`) protection across `/api/v1/auth/*` and `/api/v1/build/*`, returning `429 RATE_LIMITED` with `Retry-After: 60`.
 - **Runner Strict Rate-Limit Migration**: Added `project-info-docs/migrations/2026-02-24_runner_strict_submit_rate_limit.sql` to harden `check_request()` to deterministic `2 submissions / 60 seconds / anon IP` with advisory-lock serialization.
-- **Backend Hardening Migration**: Added `project-info-docs/migrations/2026-02-24_backend_hardening_pre_request.sql` to activate `db_pre_request`, scope strict limiting to `rpc/submit_form`, harden entitlements grants, and schedule rate-limit cleanup.
 - **Runner DB Functions + Privilege Hardening**: Added `get_published_form_by_id(UUID)` and `get_form_submission_quota(UUID)` plus explicit execute grants/revokes for runner and submission-rate-limit functions.
 - **Runner Migration**: Added `project-info-docs/migrations/2026-02-23_runner_public_api_v1.sql` for runner function and grant rollout.
 - **Runner Validation Schemas**: Added `runnerFormParamSchema`, `runnerSubmitBodySchema`, and `runnerIdempotencyHeaderSchema` in `src/utils/validation.ts`.
@@ -38,15 +43,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 - **Edge-Native Supabase Client**: Added `getSupabaseClient` in `src/db/supabase.ts` which forces `auth.autoRefreshToken: false` and `auth.persistSession: false` to ensure memory safety on headless V8 Isolates.
 - **Middleware**: Created `requireAuth` Hono middleware in `src/middlewares/auth.ts` to seamlessly block unauthenticated requests and cryptographically verify Bearer JWTs using Supabase.
 - **Zod Validation**: Implemented strict schema parsers (`signUpSchema`, `loginSchema`) in `src/utils/validation.ts` to sanitize email/password inputs natively on the edge before they reach the database.
-- **Environment Bindings**: Defined rigorous TypeScript bindings for Cloudflare environment secrets (`SUPABASE_URL`, `SUPABASE_ANON_KEY`) and custom context variables in `src/types/index.ts`.
+- **Environment Bindings**: Defined rigorous TypeScript bindings for Cloudflare environment secrets (`SUPABASE_URL`, `SUPABASE_ANON_KEY`, `SUPABASE_SERVICE_ROLE_KEY`) and custom context variables in `src/types/index.ts`.
 - **Developer Documentation**: Authored `dev-docs.md` outlining the API routing strategy, architectural philosophy ("Thick Database, Thin Edge"), and edge coding standards.
 
 ### Changed
-- **Runner Submit Strong Rate-Limit Enforcement**: `/api/v1/f/:formId/submit` now relies on `db_pre_request` (`public.check_request`) scoped to `rpc/submit_form` to enforce strict DB-backed throttling (2/60 per anon IP) without duplicate counting.
-- **Logout Determinism**: `POST /api/v1/auth/logout` now returns non-200 on Supabase sign-out failure and only returns success when global token revocation succeeds.
+- **Runner Submit Strong Rate-Limit Enforcement**: `/api/v1/f/:formId/submit` now uses explicit `check_request()` RPC gating before form processing to enforce strict DB-backed throttling (2/60 per anon IP), independent of idempotency-key variance.
 - **Rate-Limit Failure Policy by Surface**: Auth/build Worker-native middleware remains fail-open on limiter runtime errors, while runner submit strict gate is fail-closed (`500 RATE_LIMIT_CHECK_FAILED`) when strict rate-limit evaluation fails.
 - **Deterministic 500 Envelope for Submit Path**: Wrapped `/api/v1/f/:formId/submit` execution in guarded `try/catch` and now return `{ error, code: "RUNNER_INTERNAL_ERROR" }` for previously opaque worker-level failures.
-- **No Privileged-Key Runtime Contract**: Removed project runtime dependency/docs on privileged admin keys; logout and API flows now rely on anon-key + request JWT context.
 - **Dependency Graph Alignment**: Updated dependency set and lockfile to aligned versions (`hono@4.12.x`, `@hono/zod-validator@0.7.x`, `zod@4.3.x`, `wrangler@4.67+`) to avoid mixed-runtime behavior.
 - **Zod v4 Compatibility Update**: Updated record schema usage in `src/utils/validation.ts` to Zod v4-compatible signatures (`z.record(z.string(), z.unknown())`).
 

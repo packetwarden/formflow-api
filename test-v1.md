@@ -31,9 +31,6 @@ Before running tests:
 2. Use DB baseline `project-info-docs/formflow_beta_schema_v2.sql`.
 3. If upgrading existing V1 DB, run:
    - `project-info-docs/migrations/2026-02-23_fix_publish_form.sql`
-   - `project-info-docs/migrations/2026-02-23_runner_public_api_v1.sql`
-   - `project-info-docs/migrations/2026-02-24_runner_strict_submit_rate_limit.sql`
-   - `project-info-docs/migrations/2026-02-24_backend_hardening_pre_request.sql`
 4. Have at least one test user email/password ready (owner/editor).
 5. Optional for permission negative tests: a second user with `viewer` role in the same workspace.
 
@@ -171,7 +168,9 @@ Request:
 
 Expected:
 1. `200`
-2. Body includes `{ "message": "Logout successful", "scope": "global" }`.
+2. Body message indicates client should remove locally stored access/refresh tokens.
+3. Refresh-token sessions are revoked server-side for this user.
+4. Existing access tokens may remain valid until their JWT `exp` timestamp.
 
 ### 7.6 List Forms
 Request:

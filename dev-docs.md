@@ -321,7 +321,7 @@ Global behavior:
 5. submit route performs logic-aware sanitization (hidden fields stripped)
 6. submit route rejects unknown payload keys (`FIELD_VALIDATION_FAILED`)
 7. submit route enforces monthly entitlement (`max_submissions_monthly`)
-8. submit route enforces strict DB rate limiting via `db_pre_request` (`public.check_request`) on `rpc/submit_form`
+8. submit route enforces strict DB rate limiting via `check_request()` before processing
 
 ### 8A.1 GET `/api/v1/f/:formId/schema`
 Purpose: load public published schema by `forms.id` UUID.
@@ -365,19 +365,20 @@ Validation:
    - optional: `started_at` ISO datetime (offset required)
 
 Execution flow:
-1. load form via `get_published_form_by_id`
-2. parse `published_schema` into strict runner contract
-3. evaluate `logic[]` and compute visibility for submitted payload
-4. strip hidden field values from payload
-5. reject unknown keys not present in published field registry
-6. enforce strict field-level validation for visible fields
-7. enforce monthly entitlement with `get_form_submission_quota`
-8. call `submit_form` RPC with:
-    - `p_form_id`
-    - sanitized `p_data`
-    - required `p_idempotency_key`
-    - metadata passthrough (`p_ip_address`, `p_user_agent`, `p_referrer`, `p_started_at`)
-9. return completion payload for runner UX
+1. run `check_request()` RPC (strict rate-limit gate: 2 submissions per 60 seconds per anon IP)
+2. load form via `get_published_form_by_id`
+3. parse `published_schema` into strict runner contract
+4. evaluate `logic[]` and compute visibility for submitted payload
+5. strip hidden field values from payload
+6. reject unknown keys not present in published field registry
+7. enforce strict field-level validation for visible fields
+8. enforce monthly entitlement with `get_form_submission_quota`
+9. call `submit_form` RPC with:
+   - `p_form_id`
+   - sanitized `p_data`
+   - required `p_idempotency_key`
+   - metadata passthrough (`p_ip_address`, `p_user_agent`, `p_referrer`, `p_started_at`)
+10. return completion payload for runner UX
 
 Strict validation contract:
 1. required field properties: `id`, `type`
@@ -415,12 +416,57 @@ Status mapping:
 
 ### 8A.3 Submit Runtime Hardening (Post Dependency Upgrade)
 Additional hardening in `src/routes/f/index.ts`:
-1. `parseStrictRateLimitError` safely parses non-standard RPC error payloads before status/code mapping (including `db_pre_request` rejections surfaced by `submit_form`).
+1. `parseStrictRateLimitError` safely parses non-standard RPC error payloads before status/code mapping.
 2. `/submit` handler is wrapped in a guarded `try/catch` and logs unhandled failures using:
    - `console.error('Runner submit unhandled error:', error)`
 3. unhandled runtime failures now return deterministic JSON instead of opaque worker text-only 500:
    - `{ "error": "Failed to submit form", "code": "RUNNER_INTERNAL_ERROR" }`
 4. `@hono/zod-validator` remains in use for both route param and JSON body validation.
+
+## 8B. Stripe Billing API v1 (Implemented)
+Stripe router file: `src/routes/stripe/index.ts`
+
+Endpoints:
+1. `POST /api/v1/stripe/workspaces/:workspaceId/checkout-session`
+2. `POST /api/v1/stripe/workspaces/:workspaceId/portal-session`
+3. `POST /api/v1/stripe/webhook`
+
+Checkout + portal behavior:
+1. both session endpoints require authenticated owner/admin workspace role
+2. self-serve checkout supports paid tiers only (`pro`, `business`)
+3. enterprise checkout is blocked with `CONTACT_SALES_REQUIRED`
+4. if a workspace already has active paid subscription, checkout endpoint returns portal URL with:
+   - `destination: "portal"`
+   - `reason: "ALREADY_SUBSCRIBED"`
+5. checkout session uses hosted Stripe Checkout subscription mode with:
+   - promotion codes enabled
+   - automatic tax enabled
+   - optional trial days from `plan_variants.trial_period_days`
+   - metadata (`workspace_id`, `plan_variant_id`, `requested_by_user_id`)
+
+Webhook behavior:
+1. verifies `stripe-signature` using Stripe SDK `constructEventAsync`
+2. inserts `event_id` idempotently into `stripe_webhook_events`
+3. duplicate event inserts return `200` without reprocessing
+4. accepted events are processed asynchronously via `waitUntil`
+5. subscription state sync updates:
+   - `subscriptions` (source of truth)
+   - `workspaces.plan` cache
+
+Webhook event coverage:
+1. `checkout.session.completed`
+2. `customer.subscription.created`
+3. `customer.subscription.updated`
+4. `customer.subscription.deleted`
+5. `invoice.payment_failed`
+6. `invoice.paid`
+
+Scheduled jobs (Worker `scheduled` handler):
+1. webhook replay pass (`*/5 * * * *`):
+   - retries `pending|failed` rows under attempt cap
+2. grace-period downgrade pass (`0 * * * *`):
+   - downgrades expired `past_due` subscriptions to free
+   - refreshes `workspaces.plan`
 
 ## 9. Validation Catalog
 Validation file: `src/utils/validation.ts`
@@ -466,20 +512,15 @@ Runner contract additions in V2:
     - resolves workspace from form id
     - returns `max_submissions_monthly` entitlement + current monthly usage
 3. execute privilege hardening:
-    - `check_request()`: revoked from `PUBLIC`, granted to `anon, authenticated`
-    - `submit_form(...)`: revoked from `PUBLIC`, granted to `anon, authenticated`
-    - runner helper functions revoked from `PUBLIC`, granted to `anon, authenticated`
-4. pre-request activation and scope:
-   - `ALTER ROLE authenticator SET pgrst.db_pre_request = 'public.check_request'`
-   - `check_request()` is path-scoped to `rpc/submit_form`
-5. rate-limit lifecycle:
-   - `cleanup-rate-limits` pg_cron job enabled (`0 * * * *`, retention `1 hour`)
+   - `check_request()`: revoked from `PUBLIC`, granted to `anon, authenticated`
+   - `submit_form(...)`: revoked from `PUBLIC`, granted to `anon, authenticated`
+   - runner helper functions revoked from `PUBLIC`, granted to `anon, authenticated`
 
 Migration source file:
 1. `project-info-docs/migrations/2026-02-23_fix_publish_form.sql`
 2. `project-info-docs/migrations/2026-02-23_runner_public_api_v1.sql`
 3. `project-info-docs/migrations/2026-02-24_runner_strict_submit_rate_limit.sql`
-4. `project-info-docs/migrations/2026-02-24_backend_hardening_pre_request.sql`
+4. `project-info-docs/migrations/2026-02-24_stripe_checkout_portal_v1.sql`
 
 ## 11. Implementation Files Added or Updated
 Updated:
@@ -489,16 +530,21 @@ Updated:
 4. `src/types/index.ts`
 5. `src/db/supabase.ts`
 6. `src/routes/f/index.ts`
-7. `changelog.md`
-8. `dev-docs.md`
-9. `project-info-docs/formflow_beta_schema_v2.sql`
+7. `src/routes/stripe/index.ts`
+8. `src/index.ts`
+9. `src/utils/workspace-access.ts`
+10. `changelog.md`
+11. `dev-docs.md`
+12. `project-info-docs/formflow_beta_schema_v2.sql`
 
 Added:
 1. `project-info-docs/migrations/2026-02-23_fix_publish_form.sql`
 2. `project-info-docs/migrations/2026-02-23_runner_public_api_v1.sql`
 3. `project-info-docs/migrations/2026-02-24_runner_strict_submit_rate_limit.sql`
-4. `runner-api-beta.md`
-5. `test-runner-public-v1.md`
+4. `project-info-docs/migrations/2026-02-24_stripe_checkout_portal_v1.sql`
+5. `project-info-docs/stripe-implementation.md`
+6. `runner-api-beta.md`
+7. `test-runner-public-v1.md`
 
 ## 12. Operational Runbook
 For fresh database setup:
@@ -509,7 +555,7 @@ For existing V1 environments:
 1. execute `project-info-docs/migrations/2026-02-23_fix_publish_form.sql`
 2. execute `project-info-docs/migrations/2026-02-23_runner_public_api_v1.sql`
 3. execute `project-info-docs/migrations/2026-02-24_runner_strict_submit_rate_limit.sql`
-4. execute `project-info-docs/migrations/2026-02-24_backend_hardening_pre_request.sql`
+4. execute `project-info-docs/migrations/2026-02-24_stripe_checkout_portal_v1.sql`
 5. verify function privileges and runner behavior
 
 Recommended verification SQL:
@@ -554,11 +600,8 @@ npm run deploy
 ```
 
 ## 14. Known Gaps and Next Targets
-Current stubs still pending:
-1. `src/routes/stripe/index.ts`
-
 Planned next backend milestones:
-1. Stripe webhook ingestion with idempotent event log processing
+1. automated Stripe test matrix (webhook fixtures + end-to-end checkout/portal simulation)
 2. optional worker-side entitlement KV cache for high-throughput runner traffic
 3. expanded runner schema contract support for advanced field types/actions (deferred)
 

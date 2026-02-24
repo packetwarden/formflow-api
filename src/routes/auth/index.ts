@@ -59,29 +59,26 @@ authRouter.post('/login', authPublicWriteRateLimit, zValidator('json', loginSche
  * Requires Authentication.
  */
 authRouter.post('/logout', requireAuth, authUserWriteRateLimit, async (c) => {
-    const authHeader = c.req.header('Authorization')
-    const token = authHeader?.split(' ')[1]
-
-    if (!token) return c.json({ error: 'Token missing' }, 400)
+    // requireAuth already verified the JWT and stores it in request context.
+    const token = c.get('accessToken')
+    if (!token) return c.json({ error: 'Unauthorized: Missing token context' }, 401)
 
     const supabase = getSupabaseClient(c.env.SUPABASE_URL, c.env.SUPABASE_ANON_KEY)
+
+    // Revoke all refresh-token sessions for this user JWT.
     const { error } = await supabase.auth.admin.signOut(token, 'global')
-
     if (error) {
-        console.error('Auth logout error:', error)
-        const status =
-            error.status === 401 || error.status === 403 || error.status === 404
-                ? error.status
-                : 500
+        const status = (error as { status?: number }).status
+        // Treat missing/invalid/already-terminated session as idempotent success.
+        if (status === 401 || status === 403 || status === 404) {
+            return c.json({ message: 'Logged out. Please remove tokens from client storage.' }, 200)
+        }
 
-        return c.json({
-            error: 'Logout failed',
-            code: 'LOGOUT_FAILED',
-            message: error.message,
-        }, status)
+        console.error('Logout Route Error:', error.message)
+        return c.json({ error: 'Failed to log out' }, 500)
     }
 
-    return c.json({ message: 'Logout successful', scope: 'global' }, 200)
+    return c.json({ message: 'Logged out. Please remove tokens from client storage.' }, 200)
 })
 
 /**

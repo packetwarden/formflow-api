@@ -22,6 +22,14 @@ export const formParamSchema = z.object({
 export const buildParamSchema = workspaceParamSchema.merge(formParamSchema);
 export const runnerFormParamSchema = formParamSchema;
 
+const stripePlanSlugSchema = z.enum(['free', 'pro', 'business', 'enterprise']);
+const stripeBillingIntervalSchema = z.enum(['monthly', 'yearly']);
+
+export const stripeCheckoutSessionSchema = z.object({
+    plan_slug: stripePlanSlugSchema,
+    interval: stripeBillingIntervalSchema,
+}).strict();
+
 export const runnerSubmitBodySchema = z.object({
     data: z.record(z.string(), z.unknown()),
     started_at: z
@@ -115,3 +123,4 @@ export type CreateFormInput = z.infer<typeof createFormSchema>;
 export type UpdateFormMetaInput = z.infer<typeof updateFormMetaSchema>;
 export type RunnerSubmitBodyInput = z.infer<typeof runnerSubmitBodySchema>;
 export type RunnerIdempotencyHeaderInput = z.infer<typeof runnerIdempotencyHeaderSchema>;
+export type StripeCheckoutSessionInput = z.infer<typeof stripeCheckoutSessionSchema>;

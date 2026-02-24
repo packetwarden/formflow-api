@@ -1,10 +1,14 @@
 import { Hono } from 'hono'
-import type { Context } from 'hono'
 import { zValidator } from '@hono/zod-validator'
 import type { Env, Variables } from '../../types'
 import { requireAuth } from '../../middlewares/auth'
 import { buildWriteRateLimit } from '../../middlewares/rate-limit'
-import { getSupabaseClient } from '../../db/supabase'
+import {
+    AppContext,
+    checkWorkspaceAccess,
+    enforceWorkspaceRole,
+    getAuthScopedSupabaseClient,
+} from '../../utils/workspace-access'
 import {
     buildParamSchema,
     createFormSchema,
@@ -15,10 +19,7 @@ import {
 } from '../../utils/validation'
 
 const buildRouter = new Hono<{ Bindings: Env; Variables: Variables }>()
-type BuildContext = Context<{ Bindings: Env; Variables: Variables }>
-
-type WorkspaceRole = 'owner' | 'admin' | 'editor' | 'viewer'
-type RequiredWorkspaceRole = 'member' | 'editor' | 'admin'
+type BuildContext = AppContext
 
 type EntitlementRow = {
     feature_key: string
@@ -49,109 +50,7 @@ const formDetailSelect = `${formSummarySelect}, schema`
 buildRouter.use('*', requireAuth)
 buildRouter.use('*', buildWriteRateLimit)
 
-const getScopedSupabaseClient = (c: BuildContext) => {
-    return getSupabaseClient(
-        c.env.SUPABASE_URL,
-        c.env.SUPABASE_ANON_KEY,
-        c.get('accessToken')
-    )
-}
-
-const checkWorkspaceAccess = async (c: BuildContext, workspaceId: string) => {
-    const supabase = getScopedSupabaseClient(c)
-
-    const { data: workspace, error } = await supabase
-        .from('workspaces')
-        .select('id')
-        .eq('id', workspaceId)
-        .is('deleted_at', null)
-        .maybeSingle()
-
-    if (error) {
-        console.error('Build workspace access check error:', error)
-        return { ok: false as const, response: c.json({ error: 'Failed to verify workspace access' }, 500) }
-    }
-
-    if (!workspace) {
-        return { ok: false as const, response: c.json({ error: 'Workspace not found' }, 404) }
-    }
-
-    return { ok: true as const }
-}
-
-const resolveWorkspaceRole = async (c: BuildContext, workspaceId: string) => {
-    const user = c.get('user')
-
-    if (!user?.id) {
-        return { ok: false as const, response: c.json({ error: 'Unauthorized' }, 401) }
-    }
-
-    const supabase = getScopedSupabaseClient(c)
-
-    const { data: workspace, error: workspaceError } = await supabase
-        .from('workspaces')
-        .select('id, owner_id')
-        .eq('id', workspaceId)
-        .is('deleted_at', null)
-        .maybeSingle()
-
-    if (workspaceError) {
-        console.error('Build workspace role check error:', workspaceError)
-        return { ok: false as const, response: c.json({ error: 'Failed to verify workspace access' }, 500) }
-    }
-
-    if (!workspace) {
-        return { ok: false as const, response: c.json({ error: 'Workspace not found' }, 404) }
-    }
-
-    if (workspace.owner_id === user.id) {
-        return { ok: true as const, role: 'owner' as WorkspaceRole }
-    }
-
-    const { data: member, error: memberError } = await supabase
-        .from('workspace_members')
-        .select('role')
-        .eq('workspace_id', workspaceId)
-        .eq('user_id', user.id)
-        .maybeSingle()
-
-    if (memberError) {
-        console.error('Build workspace membership check error:', memberError)
-        return { ok: false as const, response: c.json({ error: 'Failed to verify workspace role' }, 500) }
-    }
-
-    if (!member) {
-        return { ok: false as const, response: c.json({ error: 'Forbidden' }, 403) }
-    }
-
-    const role = member.role
-    if (role === 'owner' || role === 'admin' || role === 'editor' || role === 'viewer') {
-        return { ok: true as const, role }
-    }
-
-    return { ok: true as const, role: 'viewer' as WorkspaceRole }
-}
-
-const hasRequiredWorkspaceRole = (role: WorkspaceRole, required: RequiredWorkspaceRole) => {
-    if (required === 'member') return true
-    if (required === 'editor') return role === 'owner' || role === 'admin' || role === 'editor'
-    return role === 'owner' || role === 'admin'
-}
-
-const enforceWorkspaceRole = async (
-    c: BuildContext,
-    workspaceId: string,
-    requiredRole: RequiredWorkspaceRole
-) => {
-    const resolvedRole = await resolveWorkspaceRole(c, workspaceId)
-    if (!resolvedRole.ok) return resolvedRole
-
-    if (!hasRequiredWorkspaceRole(resolvedRole.role, requiredRole)) {
-        return { ok: false as const, response: c.json({ error: 'Forbidden' }, 403) }
-    }
-
-    return { ok: true as const, role: resolvedRole.role }
-}
+const getScopedSupabaseClient = getAuthScopedSupabaseClient
 
 const normalizeSlugBase = (title: string) => {
     const asciiTitle = title.normalize('NFKD').replace(/[\u0300-\u036f]/g, '')
