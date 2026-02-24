@@ -14,7 +14,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 - **Logic-Aware Payload Sanitization**: Added heuristic logic evaluator for show/hide rules with alias support and hidden-field stripping before submission persistence.
 - **Runner Idempotency Enforcement**: Added required `Idempotency-Key` header validation for `/api/v1/f/:formId/submit` and wired idempotency through `submit_form` RPC.
 - **Runner Entitlement Enforcement**: Added `max_submissions_monthly` quota checks for runner submissions via `get_form_submission_quota`.
-- **Worker-Native Rate Limiting**: Added Cloudflare `ratelimits` bindings and reusable middleware for write-method (`POST|PUT|PATCH|DELETE`) protection across `/api/v1/f/*`, `/api/v1/auth/*`, and `/api/v1/build/*`, returning `429 RATE_LIMITED` with `Retry-After: 60`.
+- **Worker-Native Rate Limiting (Auth/Build)**: Added Cloudflare `ratelimits` bindings and reusable middleware for write-method (`POST|PUT|PATCH|DELETE`) protection across `/api/v1/auth/*` and `/api/v1/build/*`, returning `429 RATE_LIMITED` with `Retry-After: 60`.
+- **Runner Strict Rate-Limit Migration**: Added `project-info-docs/migrations/2026-02-24_runner_strict_submit_rate_limit.sql` to harden `check_request()` to deterministic `2 submissions / 60 seconds / anon IP` with advisory-lock serialization.
 - **Runner DB Functions + Privilege Hardening**: Added `get_published_form_by_id(UUID)` and `get_form_submission_quota(UUID)` plus explicit execute grants/revokes for runner and submission-rate-limit functions.
 - **Runner Migration**: Added `project-info-docs/migrations/2026-02-23_runner_public_api_v1.sql` for runner function and grant rollout.
 - **Runner Validation Schemas**: Added `runnerFormParamSchema`, `runnerSubmitBodySchema`, and `runnerIdempotencyHeaderSchema` in `src/utils/validation.ts`.
@@ -40,8 +41,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 - **Developer Documentation**: Authored `dev-docs.md` outlining the API routing strategy, architectural philosophy ("Thick Database, Thin Edge"), and edge coding standards.
 
 ### Changed
-- **Runner Submit Rate-Limit Source Migration**: Replaced submit-path Supabase `check_request()` RPC gate with Worker-native Cloudflare rate-limit middleware (no database rate-limit call from Worker runtime).
-- **Rate-Limit Failure Policy**: Rate-limiter middleware now follows fail-open behavior on binding/runtime errors (warn + continue) to preserve endpoint availability.
+- **Runner Submit Strong Rate-Limit Enforcement**: `/api/v1/f/:formId/submit` now uses explicit `check_request()` RPC gating before form processing to enforce strict DB-backed throttling (2/60 per anon IP), independent of idempotency-key variance.
+- **Rate-Limit Failure Policy by Surface**: Auth/build Worker-native middleware remains fail-open on limiter runtime errors, while runner submit strict gate is fail-closed (`500 RATE_LIMIT_CHECK_FAILED`) when strict rate-limit evaluation fails.
 - **Deterministic 500 Envelope for Submit Path**: Wrapped `/api/v1/f/:formId/submit` execution in guarded `try/catch` and now return `{ error, code: "RUNNER_INTERNAL_ERROR" }` for previously opaque worker-level failures.
 - **Dependency Graph Alignment**: Updated dependency set and lockfile to aligned versions (`hono@4.12.x`, `@hono/zod-validator@0.7.x`, `zod@4.3.x`, `wrangler@4.67+`) to avoid mixed-runtime behavior.
 - **Zod v4 Compatibility Update**: Updated record schema usage in `src/utils/validation.ts` to Zod v4-compatible signatures (`z.record(z.string(), z.unknown())`).

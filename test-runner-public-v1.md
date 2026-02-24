@@ -22,15 +22,13 @@ Before running tests:
    - `SUPABASE_URL`
    - `SUPABASE_ANON_KEY`
    - `SUPABASE_SERVICE_ROLE_KEY`
-   - `RUNNER_WRITE_RATE_LIMITER`
-   - `AUTH_WRITE_RATE_LIMITER`
-   - `BUILD_WRITE_RATE_LIMITER`
 2. Database must be on `project-info-docs/formflow_beta_schema_v2.sql`.
 3. For upgraded environments, apply migrations in order:
    - `project-info-docs/migrations/2026-02-23_fix_publish_form.sql`
    - `project-info-docs/migrations/2026-02-23_runner_public_api_v1.sql`
+   - `project-info-docs/migrations/2026-02-24_runner_strict_submit_rate_limit.sql`
 4. Prepare published test forms (see Section 4).
-5. Confirm Worker `ratelimits` bindings are configured in your target environment for rate-limit tests.
+5. Confirm `check_request()` strict gate is active for submit-path rate-limit tests.
 
 ## 3. Postman Environment
 Create a Postman environment with these variables:

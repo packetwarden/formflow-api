@@ -3,7 +3,6 @@ import { routePath } from 'hono/route'
 import type { Env } from '../types'
 
 type RateLimiterBindingName =
-    | 'RUNNER_WRITE_RATE_LIMITER'
     | 'AUTH_WRITE_RATE_LIMITER'
     | 'BUILD_WRITE_RATE_LIMITER'
 
@@ -11,9 +10,8 @@ type ActorMode = 'anon' | 'user-or-anon'
 
 type GroupRateLimitConfig = {
     bindingName: RateLimiterBindingName
-    group: 'runner' | 'auth' | 'build'
+    group: 'auth' | 'build'
     actorMode: ActorMode
-    includeFormId?: boolean
 }
 
 const WRITE_METHODS = new Set(['POST', 'PUT', 'PATCH', 'DELETE'])
@@ -67,15 +65,7 @@ const buildRateLimitKey = (c: Context, config: GroupRateLimitConfig) => {
     const method = c.req.method.toUpperCase()
     const routeTemplate = getRouteTemplate(c)
     const actorKey = getActorKey(c, config.actorMode)
-
-    let key = `${config.group}|${actorKey}|${method}|${routeTemplate}`
-
-    if (config.includeFormId) {
-        const formId = c.req.param('formId')?.trim() || 'unknown'
-        key = `${key}|form:${formId}`
-    }
-
-    return key
+    return `${config.group}|${actorKey}|${method}|${routeTemplate}`
 }
 
 const createGroupRateLimitMiddleware = (
@@ -120,13 +110,6 @@ const createGroupRateLimitMiddleware = (
         await next()
     }
 }
-
-export const runnerWriteRateLimit = createGroupRateLimitMiddleware({
-    bindingName: 'RUNNER_WRITE_RATE_LIMITER',
-    group: 'runner',
-    actorMode: 'anon',
-    includeFormId: true,
-})
 
 export const authPublicWriteRateLimit = createGroupRateLimitMiddleware({
     bindingName: 'AUTH_WRITE_RATE_LIMITER',

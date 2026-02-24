@@ -75,10 +75,9 @@ Global middleware:
 2. `cors()`
 
 Route-level write rate limiting (Cloudflare Worker-native):
-1. `/api/v1/f/*` write endpoints use `RUNNER_WRITE_RATE_LIMITER`
-2. `/api/v1/auth/*` write endpoints use `AUTH_WRITE_RATE_LIMITER`
-3. `/api/v1/build/*` write endpoints use `BUILD_WRITE_RATE_LIMITER`
-4. only `POST`, `PUT`, `PATCH`, `DELETE` are rate-limited
+1. `/api/v1/auth/*` write endpoints use `AUTH_WRITE_RATE_LIMITER`
+2. `/api/v1/build/*` write endpoints use `BUILD_WRITE_RATE_LIMITER`
+3. only `POST`, `PUT`, `PATCH`, `DELETE` are rate-limited
 
 ## 6. Authentication and Request Context Model
 `requireAuth` middleware in `src/middlewares/auth.ts` performs:
@@ -322,7 +321,7 @@ Global behavior:
 5. submit route performs logic-aware sanitization (hidden fields stripped)
 6. submit route rejects unknown payload keys (`FIELD_VALIDATION_FAILED`)
 7. submit route enforces monthly entitlement (`max_submissions_monthly`)
-8. submit route enforces Worker-native Cloudflare rate limiting before processing (no DB rate-limit RPC call)
+8. submit route enforces strict DB rate limiting via `check_request()` before processing
 
 ### 8A.1 GET `/api/v1/f/:formId/schema`
 Purpose: load public published schema by `forms.id` UUID.
@@ -366,7 +365,7 @@ Validation:
    - optional: `started_at` ISO datetime (offset required)
 
 Execution flow:
-1. apply Worker-native Cloudflare rate-limiter middleware (write-method gate)
+1. run `check_request()` RPC (strict rate-limit gate: 2 submissions per 60 seconds per anon IP)
 2. load form via `get_published_form_by_id`
 3. parse `published_schema` into strict runner contract
 4. evaluate `logic[]` and compute visibility for submitted payload
@@ -417,7 +416,7 @@ Status mapping:
 
 ### 8A.3 Submit Runtime Hardening (Post Dependency Upgrade)
 Additional hardening in `src/routes/f/index.ts`:
-1. Worker-native rate-limiter middleware is applied before submit execution with fail-open behavior on limiter binding/runtime errors.
+1. `parseStrictRateLimitError` safely parses non-standard RPC error payloads before status/code mapping.
 2. `/submit` handler is wrapped in a guarded `try/catch` and logs unhandled failures using:
    - `console.error('Runner submit unhandled error:', error)`
 3. unhandled runtime failures now return deterministic JSON instead of opaque worker text-only 500:
@@ -468,14 +467,14 @@ Runner contract additions in V2:
     - resolves workspace from form id
     - returns `max_submissions_monthly` entitlement + current monthly usage
 3. execute privilege hardening:
+   - `check_request()`: revoked from `PUBLIC`, granted to `anon, authenticated`
    - `submit_form(...)`: revoked from `PUBLIC`, granted to `anon, authenticated`
    - runner helper functions revoked from `PUBLIC`, granted to `anon, authenticated`
-4. legacy DB rate-limit function status:
-   - `check_request()` remains in schema for backward compatibility but is no longer called by Worker submit path
 
 Migration source file:
 1. `project-info-docs/migrations/2026-02-23_fix_publish_form.sql`
 2. `project-info-docs/migrations/2026-02-23_runner_public_api_v1.sql`
+3. `project-info-docs/migrations/2026-02-24_runner_strict_submit_rate_limit.sql`
 
 ## 11. Implementation Files Added or Updated
 Updated:
@@ -492,8 +491,9 @@ Updated:
 Added:
 1. `project-info-docs/migrations/2026-02-23_fix_publish_form.sql`
 2. `project-info-docs/migrations/2026-02-23_runner_public_api_v1.sql`
-3. `runner-api-beta.md`
-4. `test-runner-public-v1.md`
+3. `project-info-docs/migrations/2026-02-24_runner_strict_submit_rate_limit.sql`
+4. `runner-api-beta.md`
+5. `test-runner-public-v1.md`
 
 ## 12. Operational Runbook
 For fresh database setup:
@@ -503,7 +503,8 @@ For fresh database setup:
 For existing V1 environments:
 1. execute `project-info-docs/migrations/2026-02-23_fix_publish_form.sql`
 2. execute `project-info-docs/migrations/2026-02-23_runner_public_api_v1.sql`
-3. verify function privileges and runner behavior
+3. execute `project-info-docs/migrations/2026-02-24_runner_strict_submit_rate_limit.sql`
+4. verify function privileges and runner behavior
 
 Recommended verification SQL:
 ```sql
@@ -514,6 +515,7 @@ WHERE routine_schema = 'public'
   AND routine_name IN (
       'publish_form',
       'submit_form',
+      'check_request',
       'get_published_form_by_id',
       'get_form_submission_quota'
   );

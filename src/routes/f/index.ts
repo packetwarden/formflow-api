@@ -2,7 +2,6 @@ import { Hono } from 'hono'
 import type { Context } from 'hono'
 import { zValidator } from '@hono/zod-validator'
 import { getSupabaseClient } from '../../db/supabase'
-import { runnerWriteRateLimit } from '../../middlewares/rate-limit'
 import type { Env, RunnerSubmitSuccessResponse } from '../../types'
 import {
     runnerFormParamSchema,
@@ -1039,6 +1038,69 @@ const parseSubmissionRpcError = (error: { code: string | null; message: string }
     return null
 }
 
+const parseStrictRateLimitError = (error: unknown) => {
+    const errorRecord = isRecord(error) ? error : {}
+    const rawMessage = typeof errorRecord.message === 'string' ? errorRecord.message : null
+    const rawDetails = typeof errorRecord.details === 'string' ? errorRecord.details : null
+    const rawCode = typeof errorRecord.code === 'string' ? errorRecord.code : null
+
+    const parseJsonObject = (value: string | null) => {
+        if (!value || !value.trim().startsWith('{')) return null
+
+        try {
+            const parsed = JSON.parse(value)
+            return isRecord(parsed) ? parsed : null
+        } catch {
+            return null
+        }
+    }
+
+    const parsedMessage = parseJsonObject(rawMessage)
+    const parsedDetails = parseJsonObject(rawDetails)
+    const parsedStatus =
+        typeof parsedDetails?.status === 'number'
+            ? parsedDetails.status
+            : typeof parsedDetails?.status === 'string'
+              ? Number(parsedDetails.status)
+              : null
+
+    if (parsedStatus === 429 || rawCode === '429') {
+        return {
+            status: 429 as const,
+            payload: {
+                error:
+                    typeof parsedMessage?.message === 'string'
+                        ? parsedMessage.message
+                        : 'Too many submissions. Please wait 60 seconds and try again.',
+                code:
+                    typeof parsedMessage?.code === 'string'
+                        ? parsedMessage.code
+                        : 'RATE_LIMITED',
+            },
+            retryAfterSeconds: 60,
+        }
+    }
+
+    if (parsedStatus === 400) {
+        return {
+            status: 400 as const,
+            payload: {
+                error:
+                    typeof parsedMessage?.message === 'string'
+                        ? parsedMessage.message
+                        : 'Unable to evaluate rate limit.',
+                code:
+                    typeof parsedMessage?.code === 'string'
+                        ? parsedMessage.code
+                        : 'RATE_LIMIT_CONTEXT_MISSING',
+            },
+            retryAfterSeconds: null,
+        }
+    }
+
+    return null
+}
+
 runnerRouter.get(
     '/:formId/schema',
     zValidator('param', runnerFormParamSchema),
@@ -1082,7 +1144,6 @@ runnerRouter.get(
 
 runnerRouter.post(
     '/:formId/submit',
-    runnerWriteRateLimit,
     zValidator('param', runnerFormParamSchema),
     zValidator('json', runnerSubmitBodySchema),
     async (c) => {
@@ -1106,7 +1167,32 @@ runnerRouter.post(
             }
 
             const idempotencyKey = headerValidation.data['idempotency-key']
+            const clientIp = extractClientIp(c)
+            if (!clientIp) {
+                return c.json({
+                    error: 'Unable to determine client IP for rate limit enforcement',
+                    code: 'RATE_LIMIT_CONTEXT_MISSING',
+                }, 400)
+            }
+
             const supabase = getRunnerSupabaseClient(c)
+
+            const { error: strictRateLimitError } = await supabase.rpc('check_request')
+            if (strictRateLimitError) {
+                const mappedRateLimit = parseStrictRateLimitError(strictRateLimitError)
+                if (mappedRateLimit) {
+                    if (mappedRateLimit.retryAfterSeconds !== null) {
+                        c.header('Retry-After', String(mappedRateLimit.retryAfterSeconds))
+                    }
+                    return c.json(mappedRateLimit.payload, mappedRateLimit.status)
+                }
+
+                console.error('Runner strict rate-limit check error:', strictRateLimitError)
+                return c.json({
+                    error: 'Failed to evaluate submit rate limit',
+                    code: 'RATE_LIMIT_CHECK_FAILED',
+                }, 500)
+            }
 
             const { data: formRows, error: formError } = await supabase.rpc('get_published_form_by_id', {
                 p_form_id: formId,
@@ -1180,7 +1266,6 @@ runnerRouter.post(
                 }, 403)
             }
 
-            const clientIp = extractClientIp(c)
             const userAgent = c.req.header('user-agent')
             const referer = c.req.header('referer')
 

@@ -86,7 +86,7 @@ Status mapping:
 Submit path sequence:
 1. validate `formId` + JSON body + `Idempotency-Key`
 2. build anon Supabase client with forwarded request headers (`x-forwarded-for`, `user-agent`, `referer`)
-3. apply Worker-native Cloudflare rate-limit middleware (write-method gate)
+3. call `public.check_request()` (strict DB rate-limit gate: 2 submissions per 60 seconds per anon IP)
 4. load form with `public.get_published_form_by_id(formId)`
 5. parse/normalize `published_schema` into strict runtime contract
 6. evaluate logic (`show`/`hide`) and compute visibility state
@@ -185,7 +185,7 @@ Field id aliases:
 Defense layers:
 1. strict edge validation and contract parsing
 2. logic-aware sanitization to remove hidden-field injection attempts
-3. Worker-native Cloudflare rate limiting (`ratelimits` bindings)
+3. strict DB-backed rate-limit gate (`check_request`)
 4. DB-backed entitlement guard (`get_form_submission_quota`)
 5. atomic idempotent write path (`submit_form`)
 
@@ -196,9 +196,10 @@ Failure-mode rationale:
 
 ## 7. Database Functions and Privileges
 Runner-dependent functions:
-1. `public.submit_form(UUID, JSONB, UUID, INET, TEXT, TEXT, TIMESTAMPTZ, UUID)`
-2. `public.get_published_form_by_id(UUID)`
-3. `public.get_form_submission_quota(UUID)`
+1. `public.check_request()`
+2. `public.submit_form(UUID, JSONB, UUID, INET, TEXT, TEXT, TIMESTAMPTZ, UUID)`
+3. `public.get_published_form_by_id(UUID)`
+4. `public.get_form_submission_quota(UUID)`
 
 Privilege model:
 1. revoke execute from `PUBLIC`
@@ -206,13 +207,15 @@ Privilege model:
 
 Rollout artifacts:
 1. migration: `project-info-docs/migrations/2026-02-23_runner_public_api_v1.sql`
-2. canonical baseline: `project-info-docs/formflow_beta_schema_v2.sql`
+2. migration: `project-info-docs/migrations/2026-02-24_runner_strict_submit_rate_limit.sql`
+3. canonical baseline: `project-info-docs/formflow_beta_schema_v2.sql`
 
 ## 8. Operational Runbook
 ### 8.1 Migration Order
 Existing environment:
 1. `project-info-docs/migrations/2026-02-23_fix_publish_form.sql`
 2. `project-info-docs/migrations/2026-02-23_runner_public_api_v1.sql`
+3. `project-info-docs/migrations/2026-02-24_runner_strict_submit_rate_limit.sql`
 
 Fresh environment:
 1. apply `project-info-docs/formflow_beta_schema_v2.sql`
@@ -223,6 +226,7 @@ SELECT routine_name
 FROM information_schema.routines
 WHERE routine_schema = 'public'
   AND routine_name IN (
+      'check_request',
       'submit_form',
       'get_published_form_by_id',
       'get_form_submission_quota'
@@ -244,7 +248,7 @@ Primary test document:
 ### 8.4 Runtime Stability Notes
 1. `@hono/zod-validator` remains the request validation layer for `formId` params and submit JSON body.
 2. `/submit` includes defensive runtime containment:
-   - Worker rate-limiter middleware is fail-open on binding/runtime errors and logs warnings.
+   - `parseStrictRateLimitError` safely parses non-standard RPC error payloads and maps strict 4xx/429 responses.
    - top-level `try/catch` wraps submit execution to prevent opaque worker-level 500 crashes.
 3. If an unhandled submit-path exception still occurs, response contract is:
    - status: `500`
