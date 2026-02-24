@@ -59,29 +59,29 @@ authRouter.post('/login', authPublicWriteRateLimit, zValidator('json', loginSche
  * Requires Authentication.
  */
 authRouter.post('/logout', requireAuth, authUserWriteRateLimit, async (c) => {
-    // Extract token to sign out explicitly if needed, but the edge client handles scope
-    // If we wanted to ensure the token from headers is invalidated we'd need admin client
-    // But standard signout works within the context if we pass the token, however edge
-    // instances without persistence won't inherently "know" the session without passing the jwt
-
     const authHeader = c.req.header('Authorization')
-    const token = authHeader?.split(' ')[1] // safe, requireAuth ran
+    const token = authHeader?.split(' ')[1]
 
     if (!token) return c.json({ error: 'Token missing' }, 400)
 
     const supabase = getSupabaseClient(c.env.SUPABASE_URL, c.env.SUPABASE_ANON_KEY)
-
-    // Explicitly sign out with the provided token context via `global` headers
     const { error } = await supabase.auth.admin.signOut(token, 'global')
 
-    // NOTE: .admin.signOut requires the service_role key.
-    // We will correct this to use standard edge-centric logout if needed,
-    // but true standard `supabase.auth.signOut()` requires a local session state.
-    // Without persistence, simply ignoring the token client-side is often enough, 
-    // but to truly kill it, we use the admin API or rely on short TTLs.
+    if (error) {
+        console.error('Auth logout error:', error)
+        const status =
+            error.status === 401 || error.status === 403 || error.status === 404
+                ? error.status
+                : 500
 
-    // Let's implement the standard edge SignOut workaround:
-    return c.json({ message: 'Logged out. Please remove token from client storage.' }, 200)
+        return c.json({
+            error: 'Logout failed',
+            code: 'LOGOUT_FAILED',
+            message: error.message,
+        }, status)
+    }
+
+    return c.json({ message: 'Logout successful', scope: 'global' }, 200)
 })
 
 /**

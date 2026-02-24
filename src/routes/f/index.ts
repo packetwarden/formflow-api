@@ -1177,23 +1177,6 @@ runnerRouter.post(
 
             const supabase = getRunnerSupabaseClient(c)
 
-            const { error: strictRateLimitError } = await supabase.rpc('check_request')
-            if (strictRateLimitError) {
-                const mappedRateLimit = parseStrictRateLimitError(strictRateLimitError)
-                if (mappedRateLimit) {
-                    if (mappedRateLimit.retryAfterSeconds !== null) {
-                        c.header('Retry-After', String(mappedRateLimit.retryAfterSeconds))
-                    }
-                    return c.json(mappedRateLimit.payload, mappedRateLimit.status)
-                }
-
-                console.error('Runner strict rate-limit check error:', strictRateLimitError)
-                return c.json({
-                    error: 'Failed to evaluate submit rate limit',
-                    code: 'RATE_LIMIT_CHECK_FAILED',
-                }, 500)
-            }
-
             const { data: formRows, error: formError } = await supabase.rpc('get_published_form_by_id', {
                 p_form_id: formId,
             })
@@ -1280,6 +1263,14 @@ runnerRouter.post(
             })
 
             if (submitError) {
+                const mappedRateLimit = parseStrictRateLimitError(submitError)
+                if (mappedRateLimit) {
+                    if (mappedRateLimit.retryAfterSeconds !== null) {
+                        c.header('Retry-After', String(mappedRateLimit.retryAfterSeconds))
+                    }
+                    return c.json(mappedRateLimit.payload, mappedRateLimit.status)
+                }
+
                 const mappedError = parseSubmissionRpcError(submitError)
                 if (mappedError) {
                     return c.json(mappedError.payload, mappedError.status)

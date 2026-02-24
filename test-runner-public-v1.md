@@ -21,14 +21,14 @@ Before running tests:
 1. Deploy Worker with valid bindings:
    - `SUPABASE_URL`
    - `SUPABASE_ANON_KEY`
-   - `SUPABASE_SERVICE_ROLE_KEY`
 2. Database must be on `project-info-docs/formflow_beta_schema_v2.sql`.
 3. For upgraded environments, apply migrations in order:
    - `project-info-docs/migrations/2026-02-23_fix_publish_form.sql`
    - `project-info-docs/migrations/2026-02-23_runner_public_api_v1.sql`
    - `project-info-docs/migrations/2026-02-24_runner_strict_submit_rate_limit.sql`
+   - `project-info-docs/migrations/2026-02-24_backend_hardening_pre_request.sql`
 4. Prepare published test forms (see Section 4).
-5. Confirm `check_request()` strict gate is active for submit-path rate-limit tests.
+5. Confirm `pgrst.db_pre_request = public.check_request` is active for submit-path rate-limit tests.
 
 ## 3. Postman Environment
 Create a Postman environment with these variables:
@@ -476,7 +476,7 @@ Entitlement blocked (`403`):
 Rate limit (`429`):
 ```json
 {
-  "error": "Too many requests. Please try again later.",
+  "error": "Too many submissions. Please wait 60 seconds and try again.",
   "code": "RATE_LIMITED"
 }
 ```

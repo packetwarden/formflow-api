@@ -1,7 +1,7 @@
 # FormSandbox (FormFlow) Developer Documentation
 
-Version: 2.4 (Edge-Native 2026 Architecture)  
-Last Updated: February 23, 2026  
+Version: 2.5 (Edge-Native 2026 Architecture)  
+Last Updated: February 24, 2026  
 Owner: Backend Platform Team
 
 ## 1. Purpose
@@ -321,7 +321,7 @@ Global behavior:
 5. submit route performs logic-aware sanitization (hidden fields stripped)
 6. submit route rejects unknown payload keys (`FIELD_VALIDATION_FAILED`)
 7. submit route enforces monthly entitlement (`max_submissions_monthly`)
-8. submit route enforces strict DB rate limiting via `check_request()` before processing
+8. submit route enforces strict DB rate limiting via `db_pre_request` (`public.check_request`) on `rpc/submit_form`
 
 ### 8A.1 GET `/api/v1/f/:formId/schema`
 Purpose: load public published schema by `forms.id` UUID.
@@ -365,20 +365,19 @@ Validation:
    - optional: `started_at` ISO datetime (offset required)
 
 Execution flow:
-1. run `check_request()` RPC (strict rate-limit gate: 2 submissions per 60 seconds per anon IP)
-2. load form via `get_published_form_by_id`
-3. parse `published_schema` into strict runner contract
-4. evaluate `logic[]` and compute visibility for submitted payload
-5. strip hidden field values from payload
-6. reject unknown keys not present in published field registry
-7. enforce strict field-level validation for visible fields
-8. enforce monthly entitlement with `get_form_submission_quota`
-9. call `submit_form` RPC with:
-   - `p_form_id`
-   - sanitized `p_data`
-   - required `p_idempotency_key`
-   - metadata passthrough (`p_ip_address`, `p_user_agent`, `p_referrer`, `p_started_at`)
-10. return completion payload for runner UX
+1. load form via `get_published_form_by_id`
+2. parse `published_schema` into strict runner contract
+3. evaluate `logic[]` and compute visibility for submitted payload
+4. strip hidden field values from payload
+5. reject unknown keys not present in published field registry
+6. enforce strict field-level validation for visible fields
+7. enforce monthly entitlement with `get_form_submission_quota`
+8. call `submit_form` RPC with:
+    - `p_form_id`
+    - sanitized `p_data`
+    - required `p_idempotency_key`
+    - metadata passthrough (`p_ip_address`, `p_user_agent`, `p_referrer`, `p_started_at`)
+9. return completion payload for runner UX
 
 Strict validation contract:
 1. required field properties: `id`, `type`
@@ -416,7 +415,7 @@ Status mapping:
 
 ### 8A.3 Submit Runtime Hardening (Post Dependency Upgrade)
 Additional hardening in `src/routes/f/index.ts`:
-1. `parseStrictRateLimitError` safely parses non-standard RPC error payloads before status/code mapping.
+1. `parseStrictRateLimitError` safely parses non-standard RPC error payloads before status/code mapping (including `db_pre_request` rejections surfaced by `submit_form`).
 2. `/submit` handler is wrapped in a guarded `try/catch` and logs unhandled failures using:
    - `console.error('Runner submit unhandled error:', error)`
 3. unhandled runtime failures now return deterministic JSON instead of opaque worker text-only 500:
@@ -467,14 +466,20 @@ Runner contract additions in V2:
     - resolves workspace from form id
     - returns `max_submissions_monthly` entitlement + current monthly usage
 3. execute privilege hardening:
-   - `check_request()`: revoked from `PUBLIC`, granted to `anon, authenticated`
-   - `submit_form(...)`: revoked from `PUBLIC`, granted to `anon, authenticated`
-   - runner helper functions revoked from `PUBLIC`, granted to `anon, authenticated`
+    - `check_request()`: revoked from `PUBLIC`, granted to `anon, authenticated`
+    - `submit_form(...)`: revoked from `PUBLIC`, granted to `anon, authenticated`
+    - runner helper functions revoked from `PUBLIC`, granted to `anon, authenticated`
+4. pre-request activation and scope:
+   - `ALTER ROLE authenticator SET pgrst.db_pre_request = 'public.check_request'`
+   - `check_request()` is path-scoped to `rpc/submit_form`
+5. rate-limit lifecycle:
+   - `cleanup-rate-limits` pg_cron job enabled (`0 * * * *`, retention `1 hour`)
 
 Migration source file:
 1. `project-info-docs/migrations/2026-02-23_fix_publish_form.sql`
 2. `project-info-docs/migrations/2026-02-23_runner_public_api_v1.sql`
 3. `project-info-docs/migrations/2026-02-24_runner_strict_submit_rate_limit.sql`
+4. `project-info-docs/migrations/2026-02-24_backend_hardening_pre_request.sql`
 
 ## 11. Implementation Files Added or Updated
 Updated:
@@ -504,7 +509,8 @@ For existing V1 environments:
 1. execute `project-info-docs/migrations/2026-02-23_fix_publish_form.sql`
 2. execute `project-info-docs/migrations/2026-02-23_runner_public_api_v1.sql`
 3. execute `project-info-docs/migrations/2026-02-24_runner_strict_submit_rate_limit.sql`
-4. verify function privileges and runner behavior
+4. execute `project-info-docs/migrations/2026-02-24_backend_hardening_pre_request.sql`
+5. verify function privileges and runner behavior
 
 Recommended verification SQL:
 ```sql

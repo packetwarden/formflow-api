@@ -6,7 +6,7 @@ import { createClient, SupabaseClient } from '@supabase/supabase-js'
  * to prevent memory leaks and shared states across Workers requests.
  * 
  * @param supabaseUrl The Supabase project URL
- * @param supabaseKey The Supabase Anon Key (for client auth) or Service Role Key (for admin tasks)
+ * @param supabaseKey The Supabase project API key used by this Worker runtime
  * @param accessToken Optional JWT used to propagate request-scoped auth context for RLS
  * @param extraHeaders Optional additional headers forwarded to PostgREST (e.g. x-forwarded-for)
  * @returns An edge-ready Supabase Client

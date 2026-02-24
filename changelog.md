@@ -16,6 +16,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 - **Runner Entitlement Enforcement**: Added `max_submissions_monthly` quota checks for runner submissions via `get_form_submission_quota`.
 - **Worker-Native Rate Limiting (Auth/Build)**: Added Cloudflare `ratelimits` bindings and reusable middleware for write-method (`POST|PUT|PATCH|DELETE`) protection across `/api/v1/auth/*` and `/api/v1/build/*`, returning `429 RATE_LIMITED` with `Retry-After: 60`.
 - **Runner Strict Rate-Limit Migration**: Added `project-info-docs/migrations/2026-02-24_runner_strict_submit_rate_limit.sql` to harden `check_request()` to deterministic `2 submissions / 60 seconds / anon IP` with advisory-lock serialization.
+- **Backend Hardening Migration**: Added `project-info-docs/migrations/2026-02-24_backend_hardening_pre_request.sql` to activate `db_pre_request`, scope strict limiting to `rpc/submit_form`, harden entitlements grants, and schedule rate-limit cleanup.
 - **Runner DB Functions + Privilege Hardening**: Added `get_published_form_by_id(UUID)` and `get_form_submission_quota(UUID)` plus explicit execute grants/revokes for runner and submission-rate-limit functions.
 - **Runner Migration**: Added `project-info-docs/migrations/2026-02-23_runner_public_api_v1.sql` for runner function and grant rollout.
 - **Runner Validation Schemas**: Added `runnerFormParamSchema`, `runnerSubmitBodySchema`, and `runnerIdempotencyHeaderSchema` in `src/utils/validation.ts`.
@@ -37,13 +38,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 - **Edge-Native Supabase Client**: Added `getSupabaseClient` in `src/db/supabase.ts` which forces `auth.autoRefreshToken: false` and `auth.persistSession: false` to ensure memory safety on headless V8 Isolates.
 - **Middleware**: Created `requireAuth` Hono middleware in `src/middlewares/auth.ts` to seamlessly block unauthenticated requests and cryptographically verify Bearer JWTs using Supabase.
 - **Zod Validation**: Implemented strict schema parsers (`signUpSchema`, `loginSchema`) in `src/utils/validation.ts` to sanitize email/password inputs natively on the edge before they reach the database.
-- **Environment Bindings**: Defined rigorous TypeScript bindings for Cloudflare environment secrets (`SUPABASE_URL`, `SUPABASE_ANON_KEY`, `SUPABASE_SERVICE_ROLE_KEY`) and custom context variables in `src/types/index.ts`.
+- **Environment Bindings**: Defined rigorous TypeScript bindings for Cloudflare environment secrets (`SUPABASE_URL`, `SUPABASE_ANON_KEY`) and custom context variables in `src/types/index.ts`.
 - **Developer Documentation**: Authored `dev-docs.md` outlining the API routing strategy, architectural philosophy ("Thick Database, Thin Edge"), and edge coding standards.
 
 ### Changed
-- **Runner Submit Strong Rate-Limit Enforcement**: `/api/v1/f/:formId/submit` now uses explicit `check_request()` RPC gating before form processing to enforce strict DB-backed throttling (2/60 per anon IP), independent of idempotency-key variance.
+- **Runner Submit Strong Rate-Limit Enforcement**: `/api/v1/f/:formId/submit` now relies on `db_pre_request` (`public.check_request`) scoped to `rpc/submit_form` to enforce strict DB-backed throttling (2/60 per anon IP) without duplicate counting.
+- **Logout Determinism**: `POST /api/v1/auth/logout` now returns non-200 on Supabase sign-out failure and only returns success when global token revocation succeeds.
 - **Rate-Limit Failure Policy by Surface**: Auth/build Worker-native middleware remains fail-open on limiter runtime errors, while runner submit strict gate is fail-closed (`500 RATE_LIMIT_CHECK_FAILED`) when strict rate-limit evaluation fails.
 - **Deterministic 500 Envelope for Submit Path**: Wrapped `/api/v1/f/:formId/submit` execution in guarded `try/catch` and now return `{ error, code: "RUNNER_INTERNAL_ERROR" }` for previously opaque worker-level failures.
+- **No Privileged-Key Runtime Contract**: Removed project runtime dependency/docs on privileged admin keys; logout and API flows now rely on anon-key + request JWT context.
 - **Dependency Graph Alignment**: Updated dependency set and lockfile to aligned versions (`hono@4.12.x`, `@hono/zod-validator@0.7.x`, `zod@4.3.x`, `wrangler@4.67+`) to avoid mixed-runtime behavior.
 - **Zod v4 Compatibility Update**: Updated record schema usage in `src/utils/validation.ts` to Zod v4-compatible signatures (`z.record(z.string(), z.unknown())`).
 

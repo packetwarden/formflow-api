@@ -2,7 +2,6 @@ import { User } from '@supabase/supabase-js'
 
 export interface Env {
     SUPABASE_URL: string;
-    SUPABASE_SERVICE_ROLE_KEY: string;
     SUPABASE_ANON_KEY: string;
     AUTH_WRITE_RATE_LIMITER: RateLimit;
     BUILD_WRITE_RATE_LIMITER: RateLimit;
