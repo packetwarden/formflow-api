@@ -36,6 +36,14 @@ type WebhookEventRow = {
     status: 'pending' | 'failed' | 'processing' | 'completed'
     attempts: number
 }
+type RequiredBillingEnvKey =
+    | 'SUPABASE_URL'
+    | 'SUPABASE_SERVICE_ROLE_KEY'
+    | 'STRIPE_SECRET_KEY'
+    | 'CHECKOUT_SUCCESS_URL'
+    | 'CHECKOUT_CANCEL_URL'
+    | 'BILLING_PORTAL_RETURN_URL'
+    | 'CONTACT_SALES_URL'
 
 const stripeCryptoProvider = Stripe.createSubtleCryptoProvider()
 
@@ -66,6 +74,50 @@ const truncateError = (value: unknown, maxLength = 1000) => {
             ? value
             : JSON.stringify(value)
     return text.length > maxLength ? `${text.slice(0, maxLength - 3)}...` : text
+}
+
+const isNonEmptyString = (value: unknown): value is string => typeof value === 'string' && value.trim().length > 0
+
+const getMissingBillingEnv = (env: Env, requiredKeys: RequiredBillingEnvKey[]) => {
+    return requiredKeys.filter((key) => !isNonEmptyString(env[key]))
+}
+
+const toCheckoutErrorResponse = (error: unknown) => {
+    if (error instanceof Stripe.errors.StripeError) {
+        return {
+            error: 'Failed to create Stripe checkout session',
+            code: 'STRIPE_CHECKOUT_SESSION_FAILED',
+            stripe_message: error.message,
+            stripe_type: error.type,
+            stripe_code: error.code ?? null,
+            stripe_request_id: error.requestId ?? null,
+        }
+    }
+
+    return {
+        error: 'Failed to create Stripe checkout session',
+        code: 'STRIPE_CHECKOUT_SESSION_FAILED',
+        details: truncateError(error, 300),
+    }
+}
+
+const toPortalErrorResponse = (error: unknown) => {
+    if (error instanceof Stripe.errors.StripeError) {
+        return {
+            error: 'Failed to create Stripe billing portal session',
+            code: 'STRIPE_PORTAL_SESSION_FAILED',
+            stripe_message: error.message,
+            stripe_type: error.type,
+            stripe_code: error.code ?? null,
+            stripe_request_id: error.requestId ?? null,
+        }
+    }
+
+    return {
+        error: 'Failed to create Stripe billing portal session',
+        code: 'STRIPE_PORTAL_SESSION_FAILED',
+        details: truncateError(error, 300),
+    }
 }
 
 const resolveStripeCustomerId = (
@@ -634,6 +686,23 @@ stripeRouter.post(
             }, 400)
         }
 
+        const missingEnv = getMissingBillingEnv(c.env, [
+            'SUPABASE_URL',
+            'SUPABASE_SERVICE_ROLE_KEY',
+            'STRIPE_SECRET_KEY',
+            'CHECKOUT_SUCCESS_URL',
+            'CHECKOUT_CANCEL_URL',
+            'BILLING_PORTAL_RETURN_URL',
+            'CONTACT_SALES_URL',
+        ])
+        if (missingEnv.length > 0) {
+            return c.json({
+                error: 'Stripe billing configuration is incomplete',
+                code: 'BILLING_CONFIG_MISSING',
+                missing: missingEnv,
+            }, 500)
+        }
+
         try {
             const stripe = getStripeClient(c.env)
             const activePaid = await findActivePaidSubscription(c.env, workspaceId)
@@ -664,7 +733,7 @@ stripeRouter.post(
                 customer: customerId,
                 line_items: [{ price: variant.stripe_price_id, quantity: 1 }],
                 allow_promotion_codes: true,
-                automatic_tax: { enabled: true },
+                automatic_tax: { enabled: false },
                 success_url: c.env.CHECKOUT_SUCCESS_URL,
                 cancel_url: c.env.CHECKOUT_CANCEL_URL,
                 metadata: {
@@ -692,7 +761,7 @@ stripeRouter.post(
             }, 200)
         } catch (error) {
             console.error('Stripe checkout session error:', error)
-            return c.json({ error: 'Failed to create Stripe checkout session' }, 500)
+            return c.json(toCheckoutErrorResponse(error), 500)
         }
     }
 )
@@ -706,6 +775,21 @@ stripeRouter.post(
         const roleCheck = await enforceWorkspaceRole(c, workspaceId, 'admin')
         if (!roleCheck.ok) return roleCheck.response
 
+        const missingEnv = getMissingBillingEnv(c.env, [
+            'SUPABASE_URL',
+            'SUPABASE_SERVICE_ROLE_KEY',
+            'STRIPE_SECRET_KEY',
+            'BILLING_PORTAL_RETURN_URL',
+            'CONTACT_SALES_URL',
+        ])
+        if (missingEnv.length > 0) {
+            return c.json({
+                error: 'Stripe billing configuration is incomplete',
+                code: 'BILLING_CONFIG_MISSING',
+                missing: missingEnv,
+            }, 500)
+        }
+
         try {
             const stripe = getStripeClient(c.env)
             const customerId = await ensureWorkspaceStripeCustomerId(c.env, workspaceId, c.get('user'), stripe)
@@ -718,7 +802,7 @@ stripeRouter.post(
             return c.json({ url: session.url }, 200)
         } catch (error) {
             console.error('Stripe portal session error:', error)
-            return c.json({ error: 'Failed to create Stripe billing portal session' }, 500)
+            return c.json(toPortalErrorResponse(error), 500)
         }
     }
 )
