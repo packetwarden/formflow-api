@@ -153,7 +153,7 @@ const refreshWorkspacePlanCache = async (env: Env, workspaceId: string) => {
     const supabase = getServiceSupabase(env)
     const { data: activeRows, error: activeError } = await supabase
         .from('subscriptions')
-        .select('plans(slug)')
+        .select('plan:plans!subscriptions_plan_id_fkey(slug)')
         .eq('workspace_id', workspaceId)
         .in('status', [...ACTIVE_SUBSCRIPTION_STATUSES])
         .order('created_at', { ascending: false })
@@ -161,8 +161,8 @@ const refreshWorkspacePlanCache = async (env: Env, workspaceId: string) => {
 
     if (activeError) throw new Error(`Failed to resolve active plan: ${activeError.message}`)
 
-    const plans = activeRows?.[0]?.plans as { slug: string } | { slug: string }[] | null | undefined
-    const nextPlanSlug = Array.isArray(plans) ? plans[0]?.slug : plans?.slug
+    const plan = activeRows?.[0]?.plan as { slug: string } | { slug: string }[] | null | undefined
+    const nextPlanSlug = Array.isArray(plan) ? plan[0]?.slug : plan?.slug
 
     const { error: workspaceError } = await supabase
         .from('workspaces')
@@ -233,7 +233,7 @@ const findActivePaidSubscription = async (env: Env, workspaceId: string) => {
     const supabase = getServiceSupabase(env)
     const { data: rows, error } = await supabase
         .from('subscriptions')
-        .select('id, stripe_customer_id, plans(slug)')
+        .select('id, stripe_customer_id, plan:plans!subscriptions_plan_id_fkey(slug)')
         .eq('workspace_id', workspaceId)
         .in('status', [...ACTIVE_SUBSCRIPTION_STATUSES])
         .order('created_at', { ascending: false })
@@ -241,8 +241,8 @@ const findActivePaidSubscription = async (env: Env, workspaceId: string) => {
     if (error) throw new Error(`Failed to check active subscription: ${error.message}`)
 
     return (rows ?? []).find((row) => {
-        const plans = row.plans as { slug: string } | { slug: string }[] | null
-        const slug = Array.isArray(plans) ? plans[0]?.slug : plans?.slug
+        const plan = (row as { plan?: { slug: string } | { slug: string }[] | null }).plan
+        const slug = Array.isArray(plan) ? plan[0]?.slug : plan?.slug
         return slug !== FREE_PLAN_SLUG
     }) ?? null
 }
