@@ -30,6 +30,10 @@ export const stripeCheckoutSessionSchema = z.object({
     interval: stripeBillingIntervalSchema,
 }).strict();
 
+export const stripeCheckoutIdempotencyHeaderSchema = z.object({
+    'idempotency-key': z.string().uuid('Idempotency-Key must be a valid UUID'),
+}).strict();
+
 export const runnerSubmitBodySchema = z.object({
     data: z.record(z.string(), z.unknown()),
     started_at: z
@@ -124,3 +128,4 @@ export type UpdateFormMetaInput = z.infer<typeof updateFormMetaSchema>;
 export type RunnerSubmitBodyInput = z.infer<typeof runnerSubmitBodySchema>;
 export type RunnerIdempotencyHeaderInput = z.infer<typeof runnerIdempotencyHeaderSchema>;
 export type StripeCheckoutSessionInput = z.infer<typeof stripeCheckoutSessionSchema>;
+export type StripeCheckoutIdempotencyHeaderInput = z.infer<typeof stripeCheckoutIdempotencyHeaderSchema>;

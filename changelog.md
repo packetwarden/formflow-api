@@ -9,6 +9,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 ## [Unreleased]
 
 ### Added
+- **Stripe Billing Hardening v2**: Upgraded `src/routes/stripe/index.ts` with checkout idempotency ledger, lease-based webhook claims, stale-claim recovery, catalog sync, and hardened webhook guards.
+- **Checkout Idempotency Header Contract**: `POST /api/v1/stripe/workspaces/:workspaceId/checkout-session` now requires `Idempotency-Key` UUID with deterministic error codes (`IDEMPOTENCY_KEY_REUSED_WITH_DIFFERENT_PAYLOAD`, `IDEMPOTENCY_KEY_EXPIRED`).
+- **Stripe Catalog Sync Surface**: Added internal `POST /api/v1/stripe/catalog/sync` endpoint (token-protected) and scheduled catalog sync support (`STRIPE_CATALOG_SYNC_CRON` / default `*/15 * * * *`).
+- **Workspace Billing Customer Mapping**: Added `workspace_billing_customers` table model (one Stripe customer per workspace) and route-level usage.
+- **Checkout Idempotency Ledger Table**: Added migration-backed `stripe_checkout_idempotency` table to persist checkout request/session mapping beyond Stripe's 24h idempotency cache.
+- **Webhook Claim-Lease Metadata**: Added `processor_id`, `processing_started_at`, `claim_expires_at`, and `next_attempt_at` queue fields with new claim indexes for replay/recovery.
+- **Race-Safe Free Subscription Function**: Added `ensure_free_subscription_for_workspace(UUID, TEXT)` with workspace advisory lock and `INSERT ... ON CONFLICT DO NOTHING`.
+- **Webhook Claim RPC**: Added `claim_stripe_webhook_event(TEXT, TEXT, INTEGER, INTEGER)` to atomically claim/reclaim webhook jobs.
+- **Stripe v2 Migration**: Added `project-info-docs/migrations/2026-02-25_stripe_billing_hardening_v2.sql`.
+- **Stripe v2 Rollback Migration**: Added `project-info-docs/migrations/2026-02-25_stripe_billing_hardening_v2_rollback_to_v1.sql` for emergency schema downgrade to Stripe v1 contract.
+- **Expanded Stripe Schedules**: Added catalog sync and webhook cleanup crons in `wrangler.jsonc` (`*/15 * * * *`, `30 2 * * *`).
+- **Stripe v2 Documentation Set**: Updated `dev-docs.md`, `prd-backend.md`, `project-info-docs/stripe-implementation.md`, `project-info-docs/stripe-dashboard-setup.md`, `test-stripe-v1.md`, `test-v1.md`, and schema baseline comments for the hardening release.
 - **Stripe Hosted Billing v1**: Implemented `/api/v1/stripe/workspaces/:workspaceId/checkout-session`, `/portal-session`, and `/webhook` in `src/routes/stripe/index.ts` with owner/admin gating, hosted checkout, and customer portal support.
 - **Stripe Webhook Idempotency + Async Processing**: Added verified webhook ingestion (`constructEventAsync`) with idempotent event storage in `stripe_webhook_events` and async event processing status transitions (`pending` -> `processing` -> `completed|failed`).
 - **Stripe Retry + Grace Scheduler**: Added scheduled handlers (cron) for webhook replay (`*/5 * * * *`) and grace-period downgrade enforcement (`0 * * * *`) through `runStripeScheduled`.
@@ -47,6 +59,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 - **Developer Documentation**: Authored `dev-docs.md` outlining the API routing strategy, architectural philosophy ("Thick Database, Thin Edge"), and edge coding standards.
 
 ### Changed
+- **Stripe Status Policy Alignment**: Entitled status set is now `active|trialing|past_due`; `unpaid|paused|canceled` trigger immediate free-tier ensure.
+- **Invoice Event Handling**: `invoice.payment_failed` and `invoice.paid` now mutate `grace_period_end` only and no longer force subscription status in DB.
+- **Checkout Security Envelope**: Stripe internals are no longer returned to clients; checkout/portal errors now return stable app code + `correlation_id`.
+- **Webhook Processing Resilience**: Processing model moved from simple status flip to lease claim + stale claim rescue.
+- **Stripe Tax Behavior**: Checkout session creation now sets `automatic_tax.enabled = true`.
 - **Runner Submit Strong Rate-Limit Enforcement**: `/api/v1/f/:formId/submit` now uses explicit `check_request()` RPC gating before form processing to enforce strict DB-backed throttling (2/60 per anon IP), independent of idempotency-key variance.
 - **Rate-Limit Failure Policy by Surface**: Auth/build Worker-native middleware remains fail-open on limiter runtime errors, while runner submit strict gate is fail-closed (`500 RATE_LIMIT_CHECK_FAILED`) when strict rate-limit evaluation fails.
 - **Deterministic 500 Envelope for Submit Path**: Wrapped `/api/v1/f/:formId/submit` execution in guarded `try/catch` and now return `{ error, code: "RUNNER_INTERNAL_ERROR" }` for previously opaque worker-level failures.

@@ -1,11 +1,11 @@
 # FormSandbox API v1 Postman Test Guide
 
-Version: v1  
-Last Updated: February 23, 2026  
+Version: v2  
+Last Updated: February 25, 2026  
 Target: Cloudflare Worker deployment (`/api/v1/*`)
 
 ## 1. Scope
-This guide covers testing all currently available endpoints:
+This guide covers testing core API routes:
 1. `GET /`
 2. `POST /api/v1/auth/signup`
 3. `POST /api/v1/auth/login`
@@ -18,21 +18,28 @@ This guide covers testing all currently available endpoints:
 10. `PUT /api/v1/build/:workspaceId/forms/:formId`
 11. `POST /api/v1/build/:workspaceId/forms/:formId/publish`
 12. `DELETE /api/v1/build/:workspaceId/forms/:formId`
+13. `GET /api/v1/f/:formId/schema`
+14. `POST /api/v1/f/:formId/submit`
+15. `POST /api/v1/stripe/workspaces/:workspaceId/checkout-session`
 
-Also includes expected behavior for currently unimplemented route groups:
-1. `/api/v1/f/*`
-2. `/api/v1/stripe/*`
+Stripe billing has a dedicated deep-dive matrix in `test-stripe-v1.md`.
 
 ## 2. Prerequisites
 Before running tests:
 1. Deploy Worker with valid Supabase bindings:
    - `SUPABASE_URL`
    - `SUPABASE_ANON_KEY`
+   - `SUPABASE_SERVICE_ROLE_KEY`
 2. Use DB baseline `project-info-docs/formflow_beta_schema_v2.sql`.
 3. If upgrading existing V1 DB, run:
    - `project-info-docs/migrations/2026-02-23_fix_publish_form.sql`
+   - `project-info-docs/migrations/2026-02-23_runner_public_api_v1.sql`
+   - `project-info-docs/migrations/2026-02-24_runner_strict_submit_rate_limit.sql`
+   - `project-info-docs/migrations/2026-02-24_stripe_checkout_portal_v1.sql`
+   - `project-info-docs/migrations/2026-02-25_stripe_billing_hardening_v2.sql`
 4. Have at least one test user email/password ready (owner/editor).
 5. Optional for permission negative tests: a second user with `viewer` role in the same workspace.
+6. For Stripe checks, configure Stripe env vars and test keys as documented in `test-stripe-v1.md`.
 
 ## 3. Postman Environment
 Create a Postman environment with these variables:
@@ -96,6 +103,9 @@ pm.test("Status is not 401", function () {
 | PUT | `/api/v1/build/:workspaceId/forms/:formId` | Yes | `200` / `403` / `404` / `409` |
 | POST | `/api/v1/build/:workspaceId/forms/:formId/publish` | Yes | `200` / `403` / `404` |
 | DELETE | `/api/v1/build/:workspaceId/forms/:formId` | Yes | `200` / `403` / `404` |
+| GET | `/api/v1/f/:formId/schema` | No | `200` / `400` / `404` |
+| POST | `/api/v1/f/:formId/submit` | No (`Idempotency-Key` required) | `200` / `400` / `404` / `409` / `429` |
+| POST | `/api/v1/stripe/workspaces/:workspaceId/checkout-session` | Yes (`Idempotency-Key` required) | `200` / `400` / `403` / `404` / `409` / `500` |
 
 ## 7. Detailed Postman Requests
 
@@ -375,11 +385,14 @@ Expected create response:
 1. `403`
 2. `code = PLAN_FEATURE_DISABLED`
 
-## 9. Currently Unimplemented Route Groups
-These are mounted but have no handlers yet, so expect `404`:
-1. `GET {{base_url}}/api/v1/f/<any>`
-2. `POST {{base_url}}/api/v1/f/<any>`
-3. `POST {{base_url}}/api/v1/stripe/webhook`
+## 9. Runner and Stripe Contract Notes
+1. Runner submit route (`POST /api/v1/f/:formId/submit`) requires `Idempotency-Key` UUID header.
+2. Stripe checkout route (`POST /api/v1/stripe/workspaces/:workspaceId/checkout-session`) requires `Idempotency-Key` UUID header.
+3. Stripe checkout deterministic `409` codes:
+   - `IDEMPOTENCY_KEY_REUSED_WITH_DIFFERENT_PAYLOAD`
+   - `IDEMPOTENCY_KEY_EXPIRED`
+   - `CATALOG_OUT_OF_SYNC`
+4. For full Stripe scenarios (webhooks, lease reclaim, drift sync, race tests), run `test-stripe-v1.md`.
 
 ## 10. Recommended Smoke Sequence
 Run in this order:
@@ -393,7 +406,9 @@ Run in this order:
 8. Build draft update success
 9. Build publish
 10. Build delete
-11. Logout
+11. Runner schema fetch + submit smoke
+12. Stripe checkout smoke with fresh `Idempotency-Key`
+13. Logout
 
 Pass criteria:
 1. All success-path endpoints return expected 2xx responses.

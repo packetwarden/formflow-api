@@ -1,6 +1,6 @@
 # Product Requirement Document (PRD): FormSandbox (Backend API)
 
-**Version:** 2.1 (Edge-Native 2026 Architecture)
+**Version:** 2.2 (Edge-Native 2026 Architecture)
 **Current Phase:** Backend & Infrastructure Only. (Frontend UI is strictly deferred).
 
 ## 1. Project Overview & 2026 Philosophy
@@ -81,6 +81,12 @@ The backend relies completely on the provided Beta v1 Schema. Key structural pil
 In 2026, webhooks must be treated as untrusted and highly volatile.
 
 1. **Edge Verification**: Hono verifies the Stripe cryptographic signature using Web Crypto APIs native to the Worker.
-2. **Idempotent Insert**: The event payload is immediately inserted into `stripe_webhook_events`. The `event_id` primary key prevents double-processing if Stripe fires the webhook twice.
-3. **State Sync**: The Worker parses the event (e.g., `customer.subscription.updated`) and updates the `subscriptions` table.
-4. **Resilience**: If the Worker fails during processing, the event remains marked as `pending` in the database, allowing a background pg_cron job or a Cloudflare Workflow to retry it later.
+2. **Payload Guard**: The Worker rejects oversized webhook payloads before parsing/signature work to reduce abuse surface.
+3. **Idempotent Insert**: The event payload is inserted into `stripe_webhook_events`; `event_id` remains the dedupe key.
+4. **Lease-Based Claims**: Event processing uses a DB-backed claim lease (`processor_id`, `claim_expires_at`) so stale `processing` rows can be reclaimed.
+5. **State Sync**: The Worker parses supported events and updates `subscriptions` as source of truth.
+6. **Grace Handling**: Invoice events set/clear `grace_period_end`; status transitions remain sourced from Stripe subscription state.
+7. **Terminal Status Policy**: `unpaid`, `paused`, and `canceled` immediately trigger free-tier ensure and cache refresh.
+8. **Durable Checkout Idempotency**: Checkout request dedupe is persisted in `stripe_checkout_idempotency` to extend safety beyond Stripe's 24-hour idempotency cache.
+9. **Customer Mapping Invariant**: Billing enforces one Stripe customer per workspace via `workspace_billing_customers`.
+10. **Stripe-as-Source Catalog**: Recurring prices are synced from Stripe to `plan_variants`; checkout and webhook fallback force one sync attempt on drift before deterministic failure.

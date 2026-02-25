@@ -1,7 +1,7 @@
 # FormSandbox Stripe Billing API v1 Test Guide
 
-Version: v1  
-Last Updated: February 24, 2026  
+Version: v2  
+Last Updated: February 25, 2026  
 Target: Cloudflare Worker deployment (`/api/v1/stripe/*`)
 
 ## 1. Scope
@@ -29,6 +29,7 @@ Before running tests:
    - `project-info-docs/migrations/2026-02-23_runner_public_api_v1.sql`
    - `project-info-docs/migrations/2026-02-24_runner_strict_submit_rate_limit.sql`
    - `project-info-docs/migrations/2026-02-24_stripe_checkout_portal_v1.sql`
+   - `project-info-docs/migrations/2026-02-25_stripe_billing_hardening_v2.sql`
 4. Worker bindings are configured:
    - `SUPABASE_URL`
    - `SUPABASE_ANON_KEY`
@@ -41,6 +42,14 @@ Before running tests:
    - `CONTACT_SALES_URL`
    - optional: `STRIPE_BILLING_PORTAL_CONFIGURATION_ID`
    - optional: `BILLING_GRACE_DAYS`
+   - optional: `STRIPE_WEBHOOK_CLAIM_TTL_SECONDS`
+   - optional: `STRIPE_WEBHOOK_MAX_BODY_BYTES`
+   - optional: `STRIPE_RETRY_BATCH_SIZE`
+    - optional: `STRIPE_GRACE_BATCH_SIZE`
+    - optional: `STRIPE_CATALOG_SYNC_ENABLED`
+    - optional: `STRIPE_CATALOG_SYNC_CRON`
+    - optional: `STRIPE_CATALOG_ENV`
+    - optional: `STRIPE_INTERNAL_ADMIN_TOKEN`
 5. Stripe dashboard is configured:
    - products/prices for `pro` and `business` monthly/yearly
    - customer portal enabled
@@ -61,11 +70,13 @@ Create a Postman environment with these variables:
 | `access_token` | (captured from login) | Yes |
 | `workspace_id_free` | UUID | Yes |
 | `workspace_id_paid` | UUID | Yes |
+| `checkout_idempotency_key` | UUID | Yes |
 | `checkout_session_url` | (captured) | Optional |
 | `checkout_session_id` | (captured) | Optional |
 | `portal_session_url` | (captured) | Optional |
 | `stripe_customer_id` | (captured from DB) | Optional |
 | `stripe_subscription_id` | (captured from DB) | Optional |
+| `internal_admin_token` | shared secret for internal catalog sync | Optional |
 
 ## 4. Test Data Setup
 Find free and paid workspaces:
@@ -119,12 +130,20 @@ const json = pm.response.json();
 pm.environment.set("access_token", json.session.access_token);
 ```
 
+Pre-request script for checkout requests (generate UUID key):
+```javascript
+if (!pm.environment.get("checkout_idempotency_key")) {
+  pm.environment.set("checkout_idempotency_key", crypto.randomUUID());
+}
+```
+
 ## 6. Endpoint Matrix
 | Method | Endpoint | Auth | Expected |
 |---|---|---|---|
-| POST | `/api/v1/stripe/workspaces/:workspaceId/checkout-session` | Yes (owner/admin) | `200` / `400` / `403` / `404` / `500` |
+| POST | `/api/v1/stripe/workspaces/:workspaceId/checkout-session` | Yes (owner/admin + `Idempotency-Key`) | `200` / `400` / `403` / `404` / `409` / `500` |
 | POST | `/api/v1/stripe/workspaces/:workspaceId/portal-session` | Yes (owner/admin) | `200` / `403` / `404` / `500` |
 | POST | `/api/v1/stripe/webhook` | No (signature required) | `200` / `400` / `500` |
+| POST | `/api/v1/stripe/catalog/sync` | Internal token (`x-internal-admin-token` or Bearer token) | `200` / `403` / `500` |
 
 ## 7. Detailed Postman + Stripe Tests
 
@@ -132,7 +151,9 @@ pm.environment.set("access_token", json.session.access_token);
 Request:
 1. Method: `POST`
 2. URL: `{{base_url}}/api/v1/stripe/workspaces/{{workspace_id_free}}/checkout-session`
-3. Body:
+3. Headers:
+   - `Idempotency-Key: {{checkout_idempotency_key}}` (UUID)
+4. Body:
 ```json
 {
   "plan_slug": "pro",
@@ -156,7 +177,9 @@ pm.environment.set("checkout_session_id", json.session_id);
 ### 7.2 Checkout Session (`business yearly`)
 Request:
 1. Same endpoint as `7.1`
-2. Body:
+2. Header:
+   - `Idempotency-Key: {{checkout_idempotency_key}}` (generate a new UUID for this payload)
+3. Body:
 ```json
 {
   "plan_slug": "business",
@@ -171,7 +194,9 @@ Expected:
 ### 7.3 Enterprise Rejection (`403 CONTACT_SALES_REQUIRED`)
 Request:
 1. Same endpoint as `7.1`
-2. Body:
+2. Header:
+   - `Idempotency-Key: {{checkout_idempotency_key}}` (UUID)
+3. Body:
 ```json
 {
   "plan_slug": "enterprise",
@@ -187,7 +212,9 @@ Expected:
 ### 7.4 Free Plan Rejection (`400 INVALID_PLAN_FOR_CHECKOUT`)
 Request:
 1. Same endpoint as `7.1`
-2. Body:
+2. Header:
+   - `Idempotency-Key: {{checkout_idempotency_key}}` (UUID)
+3. Body:
 ```json
 {
   "plan_slug": "free",
@@ -203,7 +230,9 @@ Expected:
 Request:
 1. Method: `POST`
 2. URL: `{{base_url}}/api/v1/stripe/workspaces/{{workspace_id_paid}}/checkout-session`
-3. Body:
+3. Headers:
+   - `Idempotency-Key: {{checkout_idempotency_key}}`
+4. Body:
 ```json
 {
   "plan_slug": "pro",
@@ -311,8 +340,8 @@ stripe trigger invoice.payment_failed
 ```
 
 Expected:
-1. subscription status becomes `past_due`
-2. `grace_period_end` is set (now + `BILLING_GRACE_DAYS`)
+1. `grace_period_end` is set (now + `BILLING_GRACE_DAYS`)
+2. subscription `status` remains sourced from Stripe subscription state (no forced invoice-status overwrite)
 
 ### 7.12 Payment Recovery Clears Grace Period
 Trigger:
@@ -321,8 +350,8 @@ stripe trigger invoice.paid
 ```
 
 Expected:
-1. subscription status becomes `active`
-2. `grace_period_end` becomes `NULL`
+1. `grace_period_end` becomes `NULL`
+2. subscription `status` remains sourced from Stripe subscription state
 
 ### 7.13 Subscription Deleted Downgrades Plan
 Trigger:
@@ -390,6 +419,111 @@ Expected:
 2. free subscription row ensured
 3. `workspaces.plan` becomes `free`
 
+### 7.17 Checkout Idempotency Replay (same key, same payload, <24h)
+Request flow:
+1. Set `checkout_idempotency_key` to a fixed UUID.
+2. Call checkout once with payload `{ "plan_slug": "pro", "interval": "monthly" }`.
+3. Call checkout again with the same header and same payload.
+
+Expected:
+1. second call returns `200`
+2. response includes `idempotent_replay = true`
+3. `session_id` on second call equals first call
+
+### 7.18 Checkout Idempotency Conflict (same key, different payload)
+Request flow:
+1. Reuse the same `checkout_idempotency_key` from `7.17`.
+2. Change payload to `{ "plan_slug": "business", "interval": "yearly" }`.
+
+Expected:
+1. response is `409`
+2. `code = IDEMPOTENCY_KEY_REUSED_WITH_DIFFERENT_PAYLOAD`
+
+### 7.19 Checkout Idempotency Expiry (>24h)
+Setup (test environment only):
+```sql
+UPDATE public.stripe_checkout_idempotency
+SET expires_at = NOW() - INTERVAL '1 minute'
+WHERE workspace_id = '<workspace_id_free>'
+  AND idempotency_key = '<uuid_used_in_7_17>';
+```
+Retry checkout with same header key and same payload.
+
+Expected:
+1. response is `409`
+2. `code = IDEMPOTENCY_KEY_EXPIRED`
+3. frontend rotates to a new UUID key and retry succeeds
+
+### 7.20 Crash-Safe Lease Reclaim (`processing` -> reclaimed)
+Setup (test environment only):
+1. pick a webhook `event_id` row with valid payload.
+2. simulate crashed worker lease:
+```sql
+UPDATE public.stripe_webhook_events
+SET status = 'processing',
+    processor_id = 'test-crash-worker',
+    processing_started_at = NOW() - INTERVAL '10 minutes',
+    claim_expires_at = NOW() - INTERVAL '2 minutes',
+    next_attempt_at = NULL
+WHERE event_id = '<event_id_under_test>';
+```
+3. wait for retry cron (`*/5 * * * *`) or trigger scheduler manually.
+
+Expected:
+1. row gets reclaimed by claim logic
+2. `attempts` increments
+3. row converges to `completed` or deterministic `failed` with `next_attempt_at`
+
+### 7.21 Free Subscription Race Safety
+Setup (test environment only):
+1. run these in two SQL sessions at the same time for the same workspace:
+```sql
+SELECT * FROM public.ensure_free_subscription_for_workspace('<workspace_uuid>', 'race-test');
+```
+2. then verify active non-Stripe free rows:
+```sql
+SELECT workspace_id, COUNT(*) AS non_stripe_entitled_rows
+FROM public.subscriptions
+WHERE workspace_id = '<workspace_uuid>'
+  AND stripe_subscription_id IS NULL
+  AND status IN ('active','trialing','past_due')
+GROUP BY workspace_id;
+```
+
+Expected:
+1. count is exactly `1`
+2. one call may report `created = true`, the other `created = false`
+
+### 7.22 Catalog Sync + Drift Recovery
+Flow:
+1. create/activate a new Stripe recurring price for an existing self-serve variant (`pro` or `business`) with required lookup key + metadata.
+2. call internal sync endpoint:
+   - `POST {{base_url}}/api/v1/stripe/catalog/sync`
+   - header: `x-internal-admin-token: {{internal_admin_token}}`
+3. verify `plan_variants.stripe_price_id` updates to the new active Stripe price.
+
+Expected:
+1. API returns `200` with sync stats
+2. checkout uses refreshed price mapping without deploy
+
+### 7.23 Unknown Price Webhook Fallback
+Flow:
+1. deliver a webhook payload whose subscription price is not currently mapped in DB.
+2. backend should force one catalog sync and retry variant mapping once.
+
+Expected:
+1. if sync resolves mapping, event completes successfully
+2. if still unresolved, event becomes `failed` with deterministic error reason
+
+### 7.24 Webhook Payload Size Guard
+Flow:
+1. send webhook request body larger than `STRIPE_WEBHOOK_MAX_BODY_BYTES` (default `262144`).
+2. include any signature header value.
+
+Expected:
+1. response is `413`
+2. event is not inserted into `stripe_webhook_events`
+
 ## 8. Negative Tests Checklist
 1. Missing auth header on checkout/portal -> `401`
 2. Invalid `workspaceId` UUID -> `400`
@@ -398,9 +532,14 @@ Expected:
 5. `plan_slug = enterprise` -> `403 CONTACT_SALES_REQUIRED`
 6. `plan_slug = free` -> `400 INVALID_PLAN_FOR_CHECKOUT`
 7. invalid interval value -> `400`
-8. missing webhook signature -> `400`
-9. invalid webhook signature -> `400`
-10. duplicate webhook replay -> `200` and no duplicate side effects
+8. missing `Idempotency-Key` on checkout -> `400 FIELD_VALIDATION_FAILED`
+9. same key + different payload -> `409 IDEMPOTENCY_KEY_REUSED_WITH_DIFFERENT_PAYLOAD`
+10. same key after expiry -> `409 IDEMPOTENCY_KEY_EXPIRED`
+11. missing webhook signature -> `400`
+12. invalid webhook signature -> `400`
+13. oversized webhook body -> `413`
+14. duplicate webhook replay -> `200` and no duplicate side effects
+15. `/api/v1/stripe/catalog/sync` without internal token -> `403`
 
 ## 9. Expected Response Shapes
 Checkout success (`200`):
@@ -444,29 +583,69 @@ Webhook invalid signature (`400`):
 }
 ```
 
+Idempotency key reused with different payload (`409`):
+```json
+{
+  "error": "Idempotency key was reused with a different request payload",
+  "code": "IDEMPOTENCY_KEY_REUSED_WITH_DIFFERENT_PAYLOAD"
+}
+```
+
+Idempotency key expired (`409`):
+```json
+{
+  "error": "Idempotency key is expired. Generate a new key and retry.",
+  "code": "IDEMPOTENCY_KEY_EXPIRED"
+}
+```
+
+Catalog out of sync (`409`):
+```json
+{
+  "error": "Catalog is out of sync with Stripe",
+  "code": "CATALOG_OUT_OF_SYNC",
+  "correlation_id": "uuid"
+}
+```
+
+Checkout internal failure (`500`):
+```json
+{
+  "error": "Failed to create Stripe checkout session",
+  "code": "STRIPE_CHECKOUT_SESSION_FAILED",
+  "correlation_id": "uuid"
+}
+```
+
 ## 10. Recommended Smoke Sequence
 Run in this order:
 1. Login and capture `access_token`
 2. Checkout success on free workspace (`7.1`)
-3. Complete checkout on Stripe-hosted page
-4. Verify webhook + subscription sync (`7.9`)
-5. Re-call checkout for paid workspace (`7.5`)
-6. Portal session success (`7.6`)
-7. Payment failed/recovery (`7.11`, `7.12`)
-8. Duplicate webhook idempotency (`7.14`)
+3. Checkout idempotency replay/expiry suite (`7.17`, `7.18`, `7.19`)
+4. Complete checkout on Stripe-hosted page
+5. Verify webhook + subscription sync (`7.9`)
+6. Re-call checkout for paid workspace (`7.5`)
+7. Portal session success (`7.6`)
+8. Payment failed/recovery (`7.11`, `7.12`)
+9. Duplicate webhook idempotency (`7.14`)
+10. Crash-safe lease reclaim (`7.20`)
+11. Catalog sync and drift checks (`7.22`, `7.23`)
 
 Pass criteria:
 1. Success-path requests return expected `200`.
 2. Validation and authorization violations return deterministic `4xx` codes.
 3. Webhook rows converge to `completed` after retries.
 4. `workspaces.plan` always matches active paid subscription or `free`.
-5. No unexpected `5xx` responses.
+5. Free-subscription race checks never produce duplicate non-Stripe entitled rows.
+6. No unexpected `5xx` responses.
 
 ## 11. Release Checklist
 1. `cmd /c npx tsc --noEmit` passes
 2. Stripe test-mode checkout + portal flow passed
 3. All subscribed webhook events verified
-4. Idempotency replay verified (duplicate event safe)
-5. Grace-period downgrade and recovery validated
-6. Production Stripe live IDs/secrets configured separately from test mode
-7. `project-info-docs/stripe-dashboard-setup.md` completed and signed off
+4. Checkout idempotency matrix verified (`replay`, `payload conflict`, `expiry`)
+5. Webhook stale-lease reclaim validated
+6. Grace-period downgrade and recovery validated
+7. Catalog sync and unknown-price fallback validated
+8. Production Stripe live IDs/secrets configured separately from test mode
+9. `project-info-docs/stripe-dashboard-setup.md` completed and signed off

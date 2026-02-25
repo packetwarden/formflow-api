@@ -4,7 +4,11 @@ import Stripe from 'stripe'
 import type { Env, Variables } from '../../types'
 import { getServiceRoleSupabaseClient } from '../../db/supabase'
 import { requireAuth } from '../../middlewares/auth'
-import { workspaceParamSchema, stripeCheckoutSessionSchema } from '../../utils/validation'
+import {
+    workspaceParamSchema,
+    stripeCheckoutSessionSchema,
+    stripeCheckoutIdempotencyHeaderSchema,
+} from '../../utils/validation'
 import { enforceWorkspaceRole } from '../../utils/workspace-access'
 
 const stripeRouter = new Hono<{ Bindings: Env; Variables: Variables }>()
@@ -12,10 +16,24 @@ const stripeRouter = new Hono<{ Bindings: Env; Variables: Variables }>()
 const STRIPE_API_VERSION = '2026-01-28.clover' as Stripe.LatestApiVersion
 const WEBHOOK_RETRY_CRON = '*/5 * * * *'
 const GRACE_DOWNGRADE_CRON = '0 * * * *'
-const ACTIVE_SUBSCRIPTION_STATUSES = ['active', 'trialing', 'past_due', 'unpaid', 'paused'] as const
+const WEBHOOK_CLEANUP_CRON = '30 2 * * *'
+const DEFAULT_CATALOG_SYNC_CRON = '*/15 * * * *'
+
+const ENTITLED_SUBSCRIPTION_STATUSES = ['active', 'trialing', 'past_due'] as const
+const MANAGEABLE_SUBSCRIPTION_STATUSES = ['active', 'trialing', 'past_due', 'unpaid', 'paused'] as const
+const NON_ENTITLED_TERMINAL_STATUSES = ['canceled', 'unpaid', 'paused'] as const
 const MAX_WEBHOOK_ATTEMPTS = 8
-const WEBHOOK_RETRY_BATCH_SIZE = 25
+const DEFAULT_RETRY_BATCH_SIZE = 200
+const DEFAULT_GRACE_BATCH_SIZE = 500
+const DEFAULT_WEBHOOK_CLAIM_TTL_SECONDS = 300
+const DEFAULT_WEBHOOK_MAX_BODY_BYTES = 262_144
+const DEFAULT_GRACE_DAYS = 7
+const DEFAULT_WEBHOOK_RETENTION_DAYS = 30
+const CHECKOUT_IDEMPOTENCY_TTL_MS = 24 * 60 * 60 * 1000
 const FREE_PLAN_SLUG = 'free'
+const CATALOG_PLAN_SLUGS = ['pro', 'business'] as const
+const CATALOG_INTERVALS = ['monthly', 'yearly'] as const
+const CATALOG_CURRENCY = 'usd'
 
 type MappedSubscriptionStatus = 'trialing' | 'active' | 'past_due' | 'canceled' | 'unpaid' | 'paused'
 type PlanVariantRow = {
@@ -23,6 +41,8 @@ type PlanVariantRow = {
     plan_id: string
     stripe_price_id: string | null
     trial_period_days: number
+    interval: 'monthly' | 'yearly'
+    currency: string
 }
 type ExistingSubscriptionRow = {
     id: string
@@ -32,9 +52,23 @@ type ExistingSubscriptionRow = {
 }
 type WebhookEventRow = {
     event_id: string
+}
+type ClaimedWebhookEventRow = {
+    event_id: string
     payload: unknown
-    status: 'pending' | 'failed' | 'processing' | 'completed'
     attempts: number
+    status: 'processing'
+}
+type CheckoutIdempotencyRow = {
+    idempotency_key: string
+    workspace_id: string
+    plan_variant_id: string
+    request_fingerprint: string
+    stripe_idempotency_key: string
+    stripe_checkout_session_id: string | null
+    stripe_checkout_session_url: string | null
+    status: 'in_progress' | 'completed' | 'failed'
+    expires_at: string
 }
 type RequiredBillingEnvKey =
     | 'SUPABASE_URL'
@@ -43,7 +77,28 @@ type RequiredBillingEnvKey =
     | 'CHECKOUT_SUCCESS_URL'
     | 'CHECKOUT_CANCEL_URL'
     | 'BILLING_PORTAL_RETURN_URL'
-    | 'CONTACT_SALES_URL'
+
+type CatalogSyncResult = {
+    enabled: boolean
+    forced: boolean
+    scanned_prices: number
+    eligible_prices: number
+    updated_variants: number
+    missing_variants: string[]
+}
+
+type CatalogCandidate = {
+    planSlug: 'pro' | 'business'
+    interval: 'monthly' | 'yearly'
+    currency: 'usd'
+    stripePriceId: string
+    amountCents: number
+    created: number
+}
+
+class CatalogOutOfSyncError extends Error {
+    code = 'CATALOG_OUT_OF_SYNC' as const
+}
 
 const stripeCryptoProvider = Stripe.createSubtleCryptoProvider()
 
@@ -57,15 +112,23 @@ const getServiceSupabase = (env: Env) => getServiceRoleSupabaseClient(
     env.SUPABASE_SERVICE_ROLE_KEY
 )
 
-const parseGraceDays = (env: Env) => {
-    const parsed = Number.parseInt(env.BILLING_GRACE_DAYS ?? '', 10)
-    return Number.isFinite(parsed) && parsed > 0 ? parsed : 7
+const parsePositiveInt = (value: string | undefined, fallback: number) => {
+    const parsed = Number.parseInt(value ?? '', 10)
+    return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback
 }
 
-const isUuid = (value: string) => /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value)
+const parseGraceDays = (env: Env) => parsePositiveInt(env.BILLING_GRACE_DAYS, DEFAULT_GRACE_DAYS)
+const parseWebhookClaimTtlSeconds = (env: Env) => parsePositiveInt(env.STRIPE_WEBHOOK_CLAIM_TTL_SECONDS, DEFAULT_WEBHOOK_CLAIM_TTL_SECONDS)
+const parseWebhookMaxBodyBytes = (env: Env) => parsePositiveInt(env.STRIPE_WEBHOOK_MAX_BODY_BYTES, DEFAULT_WEBHOOK_MAX_BODY_BYTES)
+const parseRetryBatchSize = (env: Env) => parsePositiveInt(env.STRIPE_RETRY_BATCH_SIZE, DEFAULT_RETRY_BATCH_SIZE)
+const parseGraceBatchSize = (env: Env) => parsePositiveInt(env.STRIPE_GRACE_BATCH_SIZE, DEFAULT_GRACE_BATCH_SIZE)
+const parseCatalogSyncEnabled = (env: Env) => (env.STRIPE_CATALOG_SYNC_ENABLED ?? 'true').toLowerCase() !== 'false'
+const getCatalogSyncCron = (env: Env) => env.STRIPE_CATALOG_SYNC_CRON || DEFAULT_CATALOG_SYNC_CRON
 
-const toIsoFromUnix = (timestamp: number | null | undefined) =>
-    timestamp ? new Date(timestamp * 1000).toISOString() : null
+const isUuid = (value: string) => /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value)
+const toIsoFromUnix = (timestamp: number | null | undefined) => (timestamp ? new Date(timestamp * 1000).toISOString() : null)
+const isNonEmptyString = (value: unknown): value is string => typeof value === 'string' && value.trim().length > 0
+const getMissingBillingEnv = (env: Env, requiredKeys: RequiredBillingEnvKey[]) => requiredKeys.filter((key) => !isNonEmptyString(env[key]))
 
 const truncateError = (value: unknown, maxLength = 1000) => {
     const text = value instanceof Error
@@ -76,49 +139,40 @@ const truncateError = (value: unknown, maxLength = 1000) => {
     return text.length > maxLength ? `${text.slice(0, maxLength - 3)}...` : text
 }
 
-const isNonEmptyString = (value: unknown): value is string => typeof value === 'string' && value.trim().length > 0
+const createCorrelationId = () => crypto.randomUUID()
 
-const getMissingBillingEnv = (env: Env, requiredKeys: RequiredBillingEnvKey[]) => {
-    return requiredKeys.filter((key) => !isNonEmptyString(env[key]))
+const logStripe = (
+    level: 'info' | 'warn' | 'error',
+    message: string,
+    context: Record<string, unknown> = {}
+) => {
+    const payload = {
+        ts: new Date().toISOString(),
+        message,
+        ...context,
+    }
+    if (level === 'error') {
+        console.error('[stripe]', JSON.stringify(payload))
+        return
+    }
+    if (level === 'warn') {
+        console.warn('[stripe]', JSON.stringify(payload))
+        return
+    }
+    console.log('[stripe]', JSON.stringify(payload))
 }
 
-const toCheckoutErrorResponse = (error: unknown) => {
-    if (error instanceof Stripe.errors.StripeError) {
-        return {
-            error: 'Failed to create Stripe checkout session',
-            code: 'STRIPE_CHECKOUT_SESSION_FAILED',
-            stripe_message: error.message,
-            stripe_type: error.type,
-            stripe_code: error.code ?? null,
-            stripe_request_id: error.requestId ?? null,
-        }
-    }
+const toCheckoutErrorResponse = (correlationId: string) => ({
+    error: 'Failed to create Stripe checkout session',
+    code: 'STRIPE_CHECKOUT_SESSION_FAILED',
+    correlation_id: correlationId,
+})
 
-    return {
-        error: 'Failed to create Stripe checkout session',
-        code: 'STRIPE_CHECKOUT_SESSION_FAILED',
-        details: truncateError(error, 300),
-    }
-}
-
-const toPortalErrorResponse = (error: unknown) => {
-    if (error instanceof Stripe.errors.StripeError) {
-        return {
-            error: 'Failed to create Stripe billing portal session',
-            code: 'STRIPE_PORTAL_SESSION_FAILED',
-            stripe_message: error.message,
-            stripe_type: error.type,
-            stripe_code: error.code ?? null,
-            stripe_request_id: error.requestId ?? null,
-        }
-    }
-
-    return {
-        error: 'Failed to create Stripe billing portal session',
-        code: 'STRIPE_PORTAL_SESSION_FAILED',
-        details: truncateError(error, 300),
-    }
-}
+const toPortalErrorResponse = (correlationId: string) => ({
+    error: 'Failed to create Stripe billing portal session',
+    code: 'STRIPE_PORTAL_SESSION_FAILED',
+    correlation_id: correlationId,
+})
 
 const resolveStripeCustomerId = (
     customer: string | Stripe.Customer | Stripe.DeletedCustomer | null | undefined
@@ -149,17 +203,123 @@ const mapStripeSubscriptionStatus = (status: Stripe.Subscription.Status): Mapped
     }
 }
 
+const shouldEnsureFreeSubscription = (status: MappedSubscriptionStatus) =>
+    (NON_ENTITLED_TERMINAL_STATUSES as readonly string[]).includes(status)
+
+const isManageableSubscriptionStatus = (
+    status: string
+): status is (typeof MANAGEABLE_SUBSCRIPTION_STATUSES)[number] =>
+    (MANAGEABLE_SUBSCRIPTION_STATUSES as readonly string[]).includes(status)
+
+const digestSha256Hex = async (value: string) => {
+    const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(value))
+    return Array.from(new Uint8Array(digest)).map((byte) => byte.toString(16).padStart(2, '0')).join('')
+}
+
+const buildCheckoutRequestFingerprint = async (workspaceId: string, planVariantId: string, userId: string | null) => {
+    const payload = JSON.stringify({
+        workspace_id: workspaceId,
+        plan_variant_id: planVariantId,
+        requested_by_user_id: userId ?? 'anonymous',
+    })
+    return digestSha256Hex(payload)
+}
+
+const buildStripeCheckoutIdempotencyKey = async (
+    workspaceId: string,
+    planVariantId: string,
+    clientIdempotencyKey: string
+) => {
+    const raw = `checkout:v1:${workspaceId}:${planVariantId}:${clientIdempotencyKey}`
+    if (raw.length <= 255) return raw
+    const hash = await digestSha256Hex(raw)
+    return `checkout:v1:${workspaceId}:${planVariantId}:${hash}`
+}
+
+const isExpiredIso = (value: string) => {
+    const timestamp = Date.parse(value)
+    return Number.isFinite(timestamp) && timestamp <= Date.now()
+}
+
+const parseLookupKey = (lookupKey: string | null | undefined) => {
+    if (!lookupKey) return null
+    const parts = lookupKey.split(':')
+    if (parts.length !== 5 || parts[0] !== 'formsandbox') return null
+
+    const [, envSlug, planSlugRaw, intervalRaw, currencyRaw] = parts
+    if (planSlugRaw !== 'pro' && planSlugRaw !== 'business') return null
+    if (intervalRaw !== 'monthly' && intervalRaw !== 'yearly') return null
+    if (currencyRaw !== CATALOG_CURRENCY) return null
+
+    return {
+        envSlug,
+        planSlug: planSlugRaw as 'pro' | 'business',
+        interval: intervalRaw as 'monthly' | 'yearly',
+        currency: currencyRaw as 'usd',
+    }
+}
+
+const normalizeBooleanString = (value: string | undefined) => {
+    if (!value) return null
+    const normalized = value.trim().toLowerCase()
+    if (normalized === 'true') return true
+    if (normalized === 'false') return false
+    return null
+}
+
+const extractCatalogCandidate = (
+    price: Stripe.Price,
+    catalogEnv: string | undefined
+): CatalogCandidate | null => {
+    if (!price.active || price.currency !== CATALOG_CURRENCY) return null
+    if (!price.recurring || price.unit_amount === null || price.unit_amount < 0) return null
+
+    const interval = price.recurring.interval === 'month'
+        ? 'monthly'
+        : price.recurring.interval === 'year'
+            ? 'yearly'
+            : null
+    if (!interval) return null
+
+    const metadata = price.metadata ?? {}
+    const metadataPlan = metadata.plan_slug === 'pro' || metadata.plan_slug === 'business'
+        ? metadata.plan_slug
+        : null
+    const metadataInterval = metadata.interval === 'monthly' || metadata.interval === 'yearly'
+        ? metadata.interval
+        : null
+    const metadataSelfServe = normalizeBooleanString(metadata.self_serve)
+    const lookup = parseLookupKey(price.lookup_key)
+
+    if (lookup && catalogEnv && lookup.envSlug !== catalogEnv) return null
+
+    const planSlug = metadataPlan ?? lookup?.planSlug ?? null
+    const normalizedInterval = metadataInterval ?? lookup?.interval ?? interval
+    if (!planSlug || !normalizedInterval) return null
+    if (metadataSelfServe === false) return null
+    if (metadataSelfServe !== true && !lookup) return null
+
+    return {
+        planSlug,
+        interval: normalizedInterval,
+        currency: CATALOG_CURRENCY,
+        stripePriceId: price.id,
+        amountCents: price.unit_amount,
+        created: price.created ?? 0,
+    }
+}
+
 const refreshWorkspacePlanCache = async (env: Env, workspaceId: string) => {
     const supabase = getServiceSupabase(env)
     const { data: activeRows, error: activeError } = await supabase
         .from('subscriptions')
         .select('plan:plans!subscriptions_plan_id_fkey(slug)')
         .eq('workspace_id', workspaceId)
-        .in('status', [...ACTIVE_SUBSCRIPTION_STATUSES])
+        .in('status', [...ENTITLED_SUBSCRIPTION_STATUSES])
         .order('created_at', { ascending: false })
         .limit(1)
 
-    if (activeError) throw new Error(`Failed to resolve active plan: ${activeError.message}`)
+    if (activeError) throw new Error(`Failed to resolve entitled plan: ${activeError.message}`)
 
     const plan = activeRows?.[0]?.plan as { slug: string } | { slug: string }[] | null | undefined
     const nextPlanSlug = Array.isArray(plan) ? plan[0]?.slug : plan?.slug
@@ -172,73 +332,38 @@ const refreshWorkspacePlanCache = async (env: Env, workspaceId: string) => {
     if (workspaceError) throw new Error(`Failed to update workspace plan cache: ${workspaceError.message}`)
 }
 
-const fetchFreePlanVariant = async (env: Env) => {
+const ensureFreeSubscriptionForWorkspace = async (
+    env: Env,
+    workspaceId: string,
+    source: string
+) => {
     const supabase = getServiceSupabase(env)
+    const { data, error } = await supabase.rpc('ensure_free_subscription_for_workspace', {
+        p_workspace_id: workspaceId,
+        p_source: source,
+    })
 
-    const { data: plan, error: planError } = await supabase
-        .from('plans')
-        .select('id')
-        .eq('slug', FREE_PLAN_SLUG)
-        .eq('is_active', true)
-        .maybeSingle()
-    if (planError || !plan) throw new Error(`Failed to load free plan: ${planError?.message ?? 'missing plan'}`)
-
-    const { data: variant, error: variantError } = await supabase
-        .from('plan_variants')
-        .select('id')
-        .eq('plan_id', plan.id)
-        .eq('interval', 'monthly')
-        .eq('is_active', true)
-        .maybeSingle()
-    if (variantError || !variant) throw new Error(`Failed to load free plan variant: ${variantError?.message ?? 'missing variant'}`)
-
-    return { planId: plan.id, variantId: variant.id }
+    if (error) throw new Error(`Failed to ensure free subscription: ${error.message}`)
+    const result = Array.isArray(data) ? data[0] : data
+    logStripe('info', 'Ensured free subscription row', {
+        workspace_id: workspaceId,
+        source,
+        created: result?.created ?? null,
+        subscription_id: result?.subscription_id ?? null,
+    })
+    return result
 }
 
-const ensureFreeSubscriptionForWorkspace = async (env: Env, workspaceId: string) => {
-    const supabase = getServiceSupabase(env)
-    const { data: activeRows, error: activeError } = await supabase
-        .from('subscriptions')
-        .select('id')
-        .eq('workspace_id', workspaceId)
-        .in('status', [...ACTIVE_SUBSCRIPTION_STATUSES])
-        .limit(1)
-
-    if (activeError) throw new Error(`Failed to check active subscriptions: ${activeError.message}`)
-    if ((activeRows ?? []).length > 0) return
-
-    const { planId, variantId } = await fetchFreePlanVariant(env)
-    const now = new Date()
-    const hundredYears = new Date(now.getTime() + (100 * 365 * 24 * 60 * 60 * 1000))
-
-    const { error: insertError } = await supabase
-        .from('subscriptions')
-        .insert({
-            workspace_id: workspaceId,
-            plan_id: planId,
-            plan_variant_id: variantId,
-            status: 'active',
-            current_period_start: now.toISOString(),
-            current_period_end: hundredYears.toISOString(),
-            cancel_at_period_end: false,
-            metadata: { source: 'grace-period-downgrade' },
-        })
-
-    if (insertError && insertError.code !== '23505') {
-        throw new Error(`Failed to create free subscription: ${insertError.message}`)
-    }
-}
-
-const findActivePaidSubscription = async (env: Env, workspaceId: string) => {
+const findEntitledPaidSubscription = async (env: Env, workspaceId: string) => {
     const supabase = getServiceSupabase(env)
     const { data: rows, error } = await supabase
         .from('subscriptions')
         .select('id, stripe_customer_id, plan:plans!subscriptions_plan_id_fkey(slug)')
         .eq('workspace_id', workspaceId)
-        .in('status', [...ACTIVE_SUBSCRIPTION_STATUSES])
+        .in('status', [...ENTITLED_SUBSCRIPTION_STATUSES])
         .order('created_at', { ascending: false })
 
-    if (error) throw new Error(`Failed to check active subscription: ${error.message}`)
+    if (error) throw new Error(`Failed to check entitled subscription: ${error.message}`)
 
     return (rows ?? []).find((row) => {
         const plan = (row as { plan?: { slug: string } | { slug: string }[] | null }).plan
@@ -247,27 +372,215 @@ const findActivePaidSubscription = async (env: Env, workspaceId: string) => {
     }) ?? null
 }
 
-const resolveCheckoutPlanVariant = async (env: Env, planSlug: string, interval: 'monthly' | 'yearly') => {
+const getCheckoutIdempotencyRow = async (
+    env: Env,
+    workspaceId: string,
+    idempotencyKey: string
+) => {
     const supabase = getServiceSupabase(env)
-    const { data: plan, error: planError } = await supabase
+    const { data, error } = await supabase
+        .from('stripe_checkout_idempotency')
+        .select('idempotency_key, workspace_id, plan_variant_id, request_fingerprint, stripe_idempotency_key, stripe_checkout_session_id, stripe_checkout_session_url, status, expires_at')
+        .eq('workspace_id', workspaceId)
+        .eq('idempotency_key', idempotencyKey)
+        .maybeSingle()
+
+    if (error && error.code !== 'PGRST116') {
+        throw new Error(`Failed to load checkout idempotency row: ${error.message}`)
+    }
+
+    return (data ?? null) as CheckoutIdempotencyRow | null
+}
+
+const syncStripeCatalog = async (
+    env: Env,
+    options?: { forced?: boolean; reason?: string }
+): Promise<CatalogSyncResult> => {
+    const forced = options?.forced ?? false
+    const enabled = parseCatalogSyncEnabled(env)
+    if (!enabled && !forced) {
+        return {
+            enabled: false,
+            forced,
+            scanned_prices: 0,
+            eligible_prices: 0,
+            updated_variants: 0,
+            missing_variants: [],
+        }
+    }
+
+    const stripe = getStripeClient(env)
+    const supabase = getServiceSupabase(env)
+    const catalogEnv = env.STRIPE_CATALOG_ENV
+    let scannedPrices = 0
+    let eligiblePrices = 0
+    const bestByVariantKey = new Map<string, CatalogCandidate>()
+
+    let startingAfter: string | undefined
+    for (;;) {
+        const page = await stripe.prices.list({
+            active: true,
+            type: 'recurring',
+            limit: 100,
+            starting_after: startingAfter,
+        })
+
+        for (const price of page.data) {
+            scannedPrices += 1
+            const candidate = extractCatalogCandidate(price, catalogEnv)
+            if (!candidate) continue
+            eligiblePrices += 1
+
+            const key = `${candidate.planSlug}:${candidate.interval}:${candidate.currency}`
+            const existing = bestByVariantKey.get(key)
+            if (!existing || candidate.created > existing.created) {
+                bestByVariantKey.set(key, candidate)
+            }
+        }
+
+        if (!page.has_more || page.data.length === 0) break
+        startingAfter = page.data[page.data.length - 1]?.id
+    }
+
+    const { data: plans, error: planError } = await supabase
         .from('plans')
-        .select('id')
-        .eq('slug', planSlug)
+        .select('id, slug')
+        .in('slug', [...CATALOG_PLAN_SLUGS])
         .eq('is_active', true)
-        .maybeSingle()
-    if (planError || !plan) throw new Error(`Failed to resolve plan: ${planError?.message ?? 'missing plan'}`)
 
-    const { data: variant, error: variantError } = await supabase
+    if (planError) throw new Error(`Failed to load plans for catalog sync: ${planError.message}`)
+
+    const planIdBySlug = new Map<string, string>((plans ?? []).map((row) => [row.slug, row.id]))
+    const planIds = Array.from(planIdBySlug.values())
+    if (planIds.length === 0) {
+        return {
+            enabled: true,
+            forced,
+            scanned_prices: scannedPrices,
+            eligible_prices: eligiblePrices,
+            updated_variants: 0,
+            missing_variants: Array.from(bestByVariantKey.keys()),
+        }
+    }
+
+    const { data: variants, error: variantError } = await supabase
         .from('plan_variants')
-        .select('id, plan_id, stripe_price_id, trial_period_days')
-        .eq('plan_id', plan.id)
-        .eq('interval', interval)
+        .select('id, plan_id, interval, currency, stripe_price_id, amount_cents')
+        .in('plan_id', planIds)
+        .in('interval', [...CATALOG_INTERVALS])
+        .eq('currency', CATALOG_CURRENCY)
         .eq('is_active', true)
-        .not('stripe_price_id', 'is', null)
-        .maybeSingle()
-    if (variantError || !variant) throw new Error(`Failed to resolve plan variant: ${variantError?.message ?? 'missing variant'}`)
 
-    return variant as PlanVariantRow
+    if (variantError) throw new Error(`Failed to load plan variants for catalog sync: ${variantError.message}`)
+
+    const variantByKey = new Map<string, {
+        id: string
+        plan_id: string
+        interval: 'monthly' | 'yearly'
+        currency: string
+        stripe_price_id: string | null
+        amount_cents: number
+    }>()
+
+    for (const variant of variants ?? []) {
+        const slug = Array.from(planIdBySlug.entries()).find((entry) => entry[1] === variant.plan_id)?.[0]
+        if (!slug) continue
+        variantByKey.set(`${slug}:${variant.interval}:${variant.currency}`, variant as {
+            id: string
+            plan_id: string
+            interval: 'monthly' | 'yearly'
+            currency: string
+            stripe_price_id: string | null
+            amount_cents: number
+        })
+    }
+
+    let updatedVariants = 0
+    const missingVariants: string[] = []
+
+    for (const [key, candidate] of bestByVariantKey.entries()) {
+        const variant = variantByKey.get(key)
+        if (!variant) {
+            missingVariants.push(key)
+            continue
+        }
+
+        const needsUpdate = variant.stripe_price_id !== candidate.stripePriceId
+            || variant.amount_cents !== candidate.amountCents
+            || variant.currency !== candidate.currency
+
+        if (!needsUpdate) continue
+
+        const { error: updateError } = await supabase
+            .from('plan_variants')
+            .update({
+                stripe_price_id: candidate.stripePriceId,
+                amount_cents: candidate.amountCents,
+                currency: candidate.currency,
+                is_active: true,
+            })
+            .eq('id', variant.id)
+
+        if (updateError) throw new Error(`Failed to update plan variant during catalog sync: ${updateError.message}`)
+        updatedVariants += 1
+    }
+
+    logStripe('info', 'Stripe catalog sync completed', {
+        forced,
+        reason: options?.reason ?? null,
+        scanned_prices: scannedPrices,
+        eligible_prices: eligiblePrices,
+        updated_variants: updatedVariants,
+        missing_variants: missingVariants,
+    })
+
+    return {
+        enabled: true,
+        forced,
+        scanned_prices: scannedPrices,
+        eligible_prices: eligiblePrices,
+        updated_variants: updatedVariants,
+        missing_variants: missingVariants,
+    }
+}
+
+const resolveCheckoutPlanVariant = async (
+    env: Env,
+    planSlug: string,
+    interval: 'monthly' | 'yearly'
+) => {
+    const supabase = getServiceSupabase(env)
+    const queryVariant = async () => {
+        const { data: plan, error: planError } = await supabase
+            .from('plans')
+            .select('id')
+            .eq('slug', planSlug)
+            .eq('is_active', true)
+            .maybeSingle()
+        if (planError || !plan) throw new Error(`Failed to resolve plan: ${planError?.message ?? 'missing plan'}`)
+
+        const { data: variant, error: variantError } = await supabase
+            .from('plan_variants')
+            .select('id, plan_id, stripe_price_id, trial_period_days, interval, currency')
+            .eq('plan_id', plan.id)
+            .eq('interval', interval)
+            .eq('currency', CATALOG_CURRENCY)
+            .eq('is_active', true)
+            .not('stripe_price_id', 'is', null)
+            .maybeSingle()
+
+        if (variantError) throw new Error(`Failed to resolve plan variant: ${variantError.message}`)
+        return (variant ?? null) as PlanVariantRow | null
+    }
+
+    const first = await queryVariant()
+    if (first) return first
+
+    await syncStripeCatalog(env, { forced: true, reason: 'checkout-missing-variant' })
+    const second = await queryVariant()
+    if (second) return second
+
+    throw new CatalogOutOfSyncError(`Plan variant "${planSlug}:${interval}" is out of sync with Stripe`)
 }
 
 const ensureWorkspaceStripeCustomerId = async (
@@ -277,64 +590,59 @@ const ensureWorkspaceStripeCustomerId = async (
     stripe: Stripe
 ) => {
     const supabase = getServiceSupabase(env)
-    const { data: rows, error } = await supabase
-        .from('subscriptions')
+    const { data: mapping, error: mappingError } = await supabase
+        .from('workspace_billing_customers')
         .select('stripe_customer_id')
         .eq('workspace_id', workspaceId)
-        .not('stripe_customer_id', 'is', null)
-        .order('created_at', { ascending: false })
-        .limit(1)
+        .maybeSingle()
 
-    if (error) throw new Error(`Failed to load customer mapping: ${error.message}`)
+    if (mappingError && mappingError.code !== 'PGRST116') {
+        throw new Error(`Failed to load workspace billing customer mapping: ${mappingError.message}`)
+    }
 
-    const existingId = rows?.[0]?.stripe_customer_id
-    if (existingId) return existingId
+    if (mapping?.stripe_customer_id) return mapping.stripe_customer_id
 
     const customer = await stripe.customers.create({
         email: user?.email ?? undefined,
         name: typeof user?.user_metadata?.full_name === 'string' ? user.user_metadata.full_name : undefined,
         metadata: { workspace_id: workspaceId },
+    }, {
+        idempotencyKey: `customer:v1:${workspaceId}`,
     })
 
-    const { data: activeRows, error: activeUpdateError } = await supabase
-        .from('subscriptions')
-        .update({ stripe_customer_id: customer.id })
-        .eq('workspace_id', workspaceId)
-        .in('status', [...ACTIVE_SUBSCRIPTION_STATUSES])
-        .is('stripe_customer_id', null)
-        .select('id')
+    const { error: insertMappingError } = await supabase
+        .from('workspace_billing_customers')
+        .insert({
+            workspace_id: workspaceId,
+            stripe_customer_id: customer.id,
+        })
 
-    if (activeUpdateError) throw new Error(`Failed to persist customer mapping: ${activeUpdateError.message}`)
-    if ((activeRows ?? []).length > 0) return customer.id
-
-    const { data: fallbackRow, error: fallbackSelectError } = await supabase
-        .from('subscriptions')
-        .select('id')
-        .eq('workspace_id', workspaceId)
-        .is('stripe_customer_id', null)
-        .order('created_at', { ascending: false })
-        .limit(1)
-        .maybeSingle()
-    if (fallbackSelectError) throw new Error(`Failed to locate fallback subscription for customer mapping: ${fallbackSelectError.message}`)
-
-    if (fallbackRow?.id) {
-        const { error: fallbackUpdateError } = await supabase
-            .from('subscriptions')
-            .update({ stripe_customer_id: customer.id })
-            .eq('id', fallbackRow.id)
-        if (fallbackUpdateError) throw new Error(`Failed to persist fallback customer mapping: ${fallbackUpdateError.message}`)
-        return customer.id
+    if (insertMappingError && insertMappingError.code !== '23505') {
+        throw new Error(`Failed to persist workspace billing customer mapping: ${insertMappingError.message}`)
     }
 
-    await ensureFreeSubscriptionForWorkspace(env, workspaceId)
-    const { error: freeUpdateError } = await supabase
+    if (insertMappingError?.code === '23505') {
+        const { data: raceWinner, error: raceWinnerError } = await supabase
+            .from('workspace_billing_customers')
+            .select('stripe_customer_id')
+            .eq('workspace_id', workspaceId)
+            .maybeSingle()
+        if (raceWinnerError || !raceWinner?.stripe_customer_id) {
+            throw new Error(`Failed to resolve raced customer mapping: ${raceWinnerError?.message ?? 'missing mapping'}`)
+        }
+        return raceWinner.stripe_customer_id
+    }
+
+    const { error: syncCustomerError } = await supabase
         .from('subscriptions')
         .update({ stripe_customer_id: customer.id })
         .eq('workspace_id', workspaceId)
-        .eq('status', 'active')
         .is('stripe_customer_id', null)
 
-    if (freeUpdateError) throw new Error(`Failed to persist customer mapping after creating free subscription: ${freeUpdateError.message}`)
+    if (syncCustomerError) {
+        throw new Error(`Failed to sync stripe_customer_id into subscriptions: ${syncCustomerError.message}`)
+    }
+
     return customer.id
 }
 
@@ -353,7 +661,11 @@ const fetchExistingSubscriptionByStripeId = async (env: Env, stripeSubscriptionI
     return (data ?? null) as ExistingSubscriptionRow | null
 }
 
-const resolveWorkspaceIdForSubscription = async (env: Env, subscription: Stripe.Subscription, workspaceHint?: string | null) => {
+const resolveWorkspaceIdForSubscription = async (
+    env: Env,
+    subscription: Stripe.Subscription,
+    workspaceHint?: string | null
+) => {
     if (workspaceHint && isUuid(workspaceHint)) return workspaceHint
 
     const metadataWorkspace = subscription.metadata?.workspace_id
@@ -366,45 +678,82 @@ const resolveWorkspaceIdForSubscription = async (env: Env, subscription: Stripe.
     if (!customerId) return null
 
     const supabase = getServiceSupabase(env)
-    const { data: rows, error } = await supabase
+    const { data: mapping, error: mappingError } = await supabase
+        .from('workspace_billing_customers')
+        .select('workspace_id')
+        .eq('stripe_customer_id', customerId)
+        .limit(1)
+        .maybeSingle()
+
+    if (mappingError && mappingError.code !== 'PGRST116') {
+        throw new Error(`Failed to resolve workspace from billing customer mapping: ${mappingError.message}`)
+    }
+    if (mapping?.workspace_id) return mapping.workspace_id
+
+    const { data: fallbackRows, error: fallbackError } = await supabase
         .from('subscriptions')
         .select('workspace_id')
         .eq('stripe_customer_id', customerId)
         .order('created_at', { ascending: false })
         .limit(1)
 
-    if (error) throw new Error(`Failed to resolve workspace from customer: ${error.message}`)
-    return rows?.[0]?.workspace_id ?? null
+    if (fallbackError) throw new Error(`Failed to resolve workspace from subscription fallback: ${fallbackError.message}`)
+    return fallbackRows?.[0]?.workspace_id ?? null
 }
 
-const resolvePlanVariantFromSubscription = async (env: Env, subscription: Stripe.Subscription, existing: ExistingSubscriptionRow | null) => {
-    const priceId = subscription.items.data[0]?.price?.id ?? null
-    if (!priceId) {
-        if (!existing) throw new Error('Subscription does not include a Stripe price')
-        return { id: existing.plan_variant_id, plan_id: existing.plan_id }
-    }
-
+const findPlanVariantByPriceId = async (env: Env, priceId: string) => {
     const supabase = getServiceSupabase(env)
-    const { data: variant, error } = await supabase
+    const { data, error } = await supabase
         .from('plan_variants')
         .select('id, plan_id')
         .eq('stripe_price_id', priceId)
         .eq('is_active', true)
         .maybeSingle()
 
-    if (error || !variant) {
-        if (!existing) throw new Error(`Failed to resolve variant for Stripe price "${priceId}"`)
+    if (error && error.code !== 'PGRST116') {
+        throw new Error(`Failed to resolve plan variant by price ID: ${error.message}`)
+    }
+
+    return data ?? null
+}
+
+const resolvePlanVariantFromSubscription = async (
+    env: Env,
+    subscription: Stripe.Subscription,
+    existing: ExistingSubscriptionRow | null
+) => {
+    const priceId = subscription.items.data[0]?.price?.id ?? null
+    if (!priceId) {
+        if (!existing) throw new Error('Subscription does not include a Stripe price')
+        return { id: existing.plan_variant_id, plan_id: existing.plan_id }
+    }
+
+    let variant = await findPlanVariantByPriceId(env, priceId)
+    if (!variant) {
+        await syncStripeCatalog(env, { forced: true, reason: 'webhook-unknown-price' })
+        variant = await findPlanVariantByPriceId(env, priceId)
+    }
+
+    if (!variant) {
+        if (!existing) throw new CatalogOutOfSyncError(`Failed to resolve variant for Stripe price "${priceId}"`)
         return { id: existing.plan_variant_id, plan_id: existing.plan_id }
     }
 
     return variant
 }
 
-const upsertWorkspaceSubscriptionState = async (env: Env, workspaceId: string, subscription: Stripe.Subscription) => {
+const upsertWorkspaceSubscriptionState = async (
+    env: Env,
+    workspaceId: string,
+    subscription: Stripe.Subscription
+) => {
     const supabase = getServiceSupabase(env)
     const existingByStripeId = await fetchExistingSubscriptionByStripeId(env, subscription.id)
     const planVariant = await resolvePlanVariantFromSubscription(env, subscription, existingByStripeId)
     const mappedStatus = mapStripeSubscriptionStatus(subscription.status)
+    if (!isManageableSubscriptionStatus(mappedStatus) && mappedStatus !== 'canceled') {
+        throw new Error(`Unsupported mapped subscription status "${mappedStatus}"`)
+    }
     const nowIso = new Date().toISOString()
 
     const currentPeriodStart = subscription.items.data[0]?.current_period_start
@@ -437,20 +786,22 @@ const upsertWorkspaceSubscriptionState = async (env: Env, workspaceId: string, s
         return mappedStatus
     }
 
-    const { data: activeRows, error: activeError } = await supabase
-        .from('subscriptions')
-        .select('id')
-        .eq('workspace_id', workspaceId)
-        .in('status', [...ACTIVE_SUBSCRIPTION_STATUSES])
-        .order('created_at', { ascending: false })
-        .limit(1)
-    if (activeError) throw new Error(`Failed to resolve active workspace subscription: ${activeError.message}`)
+    if ((ENTITLED_SUBSCRIPTION_STATUSES as readonly string[]).includes(mappedStatus)) {
+        const { data: entitledRows, error: entitledError } = await supabase
+            .from('subscriptions')
+            .select('id')
+            .eq('workspace_id', workspaceId)
+            .in('status', [...ENTITLED_SUBSCRIPTION_STATUSES])
+            .order('created_at', { ascending: false })
+            .limit(1)
+        if (entitledError) throw new Error(`Failed to resolve entitled workspace subscription: ${entitledError.message}`)
 
-    const activeRowId = activeRows?.[0]?.id
-    if (activeRowId) {
-        const { error } = await supabase.from('subscriptions').update(payload).eq('id', activeRowId)
-        if (error) throw new Error(`Failed to update active workspace subscription: ${error.message}`)
-        return mappedStatus
+        const entitledRowId = entitledRows?.[0]?.id
+        if (entitledRowId) {
+            const { error } = await supabase.from('subscriptions').update(payload).eq('id', entitledRowId)
+            if (error) throw new Error(`Failed to update entitled workspace subscription: ${error.message}`)
+            return mappedStatus
+        }
     }
 
     const { error: insertError } = await supabase.from('subscriptions').insert(payload)
@@ -458,12 +809,18 @@ const upsertWorkspaceSubscriptionState = async (env: Env, workspaceId: string, s
     return mappedStatus
 }
 
-const syncSubscriptionFromStripe = async (env: Env, subscription: Stripe.Subscription, workspaceHint?: string | null) => {
+const syncSubscriptionFromStripe = async (
+    env: Env,
+    subscription: Stripe.Subscription,
+    workspaceHint?: string | null
+) => {
     const workspaceId = await resolveWorkspaceIdForSubscription(env, subscription, workspaceHint)
     if (!workspaceId) throw new Error(`Unable to resolve workspace for Stripe subscription "${subscription.id}"`)
 
     const mappedStatus = await upsertWorkspaceSubscriptionState(env, workspaceId, subscription)
-    if (mappedStatus === 'canceled') await ensureFreeSubscriptionForWorkspace(env, workspaceId)
+    if (shouldEnsureFreeSubscription(mappedStatus)) {
+        await ensureFreeSubscriptionForWorkspace(env, workspaceId, 'stripe-terminal-status')
+    }
     await refreshWorkspacePlanCache(env, workspaceId)
     return workspaceId
 }
@@ -471,13 +828,12 @@ const syncSubscriptionFromStripe = async (env: Env, subscription: Stripe.Subscri
 const setGracePeriodForSubscription = async (
     env: Env,
     stripeSubscriptionId: string,
-    nextStatus: 'past_due' | 'active',
     gracePeriodEnd: string | null
 ) => {
     const supabase = getServiceSupabase(env)
     const { data: rows, error } = await supabase
         .from('subscriptions')
-        .update({ status: nextStatus, grace_period_end: gracePeriodEnd })
+        .update({ grace_period_end: gracePeriodEnd })
         .eq('stripe_subscription_id', stripeSubscriptionId)
         .select('workspace_id')
 
@@ -485,6 +841,20 @@ const setGracePeriodForSubscription = async (
 
     const workspaceId = rows?.[0]?.workspace_id
     if (workspaceId) await refreshWorkspacePlanCache(env, workspaceId)
+}
+
+const getInvoiceSubscriptionId = (invoice: Stripe.Invoice) => {
+    const modern = invoice.parent?.subscription_details?.subscription
+    if (typeof modern === 'string') return modern
+    if (modern && typeof modern === 'object' && typeof modern.id === 'string') return modern.id
+
+    const legacy = (invoice as Stripe.Invoice & {
+        subscription?: string | Stripe.Subscription | null
+    }).subscription
+
+    if (typeof legacy === 'string') return legacy
+    if (legacy && typeof legacy === 'object' && typeof legacy.id === 'string') return legacy.id
+    return null
 }
 
 const processStripeEvent = async (env: Env, event: Stripe.Event) => {
@@ -518,8 +888,7 @@ const processStripeEvent = async (env: Env, event: Stripe.Event) => {
 
     if (event.type === 'invoice.payment_failed' || event.type === 'invoice.paid') {
         const invoice = event.data.object as Stripe.Invoice
-        const ref = invoice.parent?.subscription_details?.subscription
-        const subscriptionId = typeof ref === 'string' ? ref : ref?.id
+        const subscriptionId = getInvoiceSubscriptionId(invoice)
         if (!subscriptionId) return
 
         const subscription = await stripe.subscriptions.retrieve(subscriptionId)
@@ -528,86 +897,141 @@ const processStripeEvent = async (env: Env, event: Stripe.Event) => {
         if (event.type === 'invoice.payment_failed') {
             const graceDays = parseGraceDays(env)
             const graceEnd = new Date(Date.now() + graceDays * 24 * 60 * 60 * 1000).toISOString()
-            await setGracePeriodForSubscription(env, subscriptionId, 'past_due', graceEnd)
+            await setGracePeriodForSubscription(env, subscriptionId, graceEnd)
         } else {
-            await setGracePeriodForSubscription(env, subscriptionId, 'active', null)
+            await setGracePeriodForSubscription(env, subscriptionId, null)
         }
     }
 }
 
-const markWebhookEvent = async (env: Env, eventId: string, updates: Record<string, unknown>) => {
+const claimWebhookEvent = async (env: Env, eventId: string, processorId: string) => {
     const supabase = getServiceSupabase(env)
-    const { error } = await supabase.from('stripe_webhook_events').update(updates).eq('event_id', eventId)
-    if (error) console.error(`Failed to update webhook event ${eventId}:`, error)
+    const { data, error } = await supabase.rpc('claim_stripe_webhook_event', {
+        p_event_id: eventId,
+        p_processor_id: processorId,
+        p_ttl_seconds: parseWebhookClaimTtlSeconds(env),
+        p_max_attempts: MAX_WEBHOOK_ATTEMPTS,
+    })
+
+    if (error) throw new Error(`Failed to claim webhook event ${eventId}: ${error.message}`)
+    const row = (Array.isArray(data) ? data[0] : data) as ClaimedWebhookEventRow | null | undefined
+    return row ?? null
 }
 
-const processNewWebhookEvent = async (env: Env, event: Stripe.Event) => {
-    try {
-        await markWebhookEvent(env, event.id, { status: 'processing', attempts: 1, last_error: null })
-        await processStripeEvent(env, event)
-        await markWebhookEvent(env, event.id, {
-            status: 'completed',
-            processed_at: new Date().toISOString(),
-            last_error: null,
+const computeRetryBackoffSeconds = (attempts: number) => {
+    const exponent = Math.max(0, Math.min(attempts, 10))
+    return Math.min(3600, 15 * (2 ** exponent))
+}
+
+const markWebhookEvent = async (
+    env: Env,
+    eventId: string,
+    updates: Record<string, unknown>
+) => {
+    const supabase = getServiceSupabase(env)
+    const { error } = await supabase.from('stripe_webhook_events').update(updates).eq('event_id', eventId)
+    if (error) {
+        logStripe('error', 'Failed to update webhook event state', {
+            event_id: eventId,
+            update_error: error.message,
         })
-    } catch (error) {
-        await markWebhookEvent(env, event.id, { status: 'failed', last_error: truncateError(error) })
     }
 }
 
-const processStoredWebhookEvent = async (env: Env, row: WebhookEventRow) => {
-    const supabase = getServiceSupabase(env)
-    const { data: claimRows, error: claimError } = await supabase
-        .from('stripe_webhook_events')
-        .update({
-            status: 'processing',
-            attempts: (row.attempts ?? 0) + 1,
-            last_error: null,
-        })
-        .eq('event_id', row.event_id)
-        .eq('status', row.status)
-        .select('event_id')
-        .limit(1)
+const processWebhookEventById = async (env: Env, eventId: string) => {
+    const processorId = createCorrelationId()
+    const claim = await claimWebhookEvent(env, eventId, processorId)
+    if (!claim) return
 
-    if (claimError) throw new Error(`Failed to claim webhook event ${row.event_id}: ${claimError.message}`)
-    if (!claimRows || claimRows.length === 0) return
+    if (!claim.payload || typeof claim.payload !== 'object') {
+        await markWebhookEvent(env, eventId, {
+            status: 'failed',
+            last_error: 'Stored payload is invalid for replay',
+            processor_id: null,
+            processing_started_at: null,
+            claim_expires_at: null,
+            next_attempt_at: new Date(Date.now() + computeRetryBackoffSeconds(claim.attempts) * 1000).toISOString(),
+        })
+        return
+    }
 
     try {
-        await processStripeEvent(env, row.payload as Stripe.Event)
-        await markWebhookEvent(env, row.event_id, {
+        await processStripeEvent(env, claim.payload as Stripe.Event)
+        await markWebhookEvent(env, eventId, {
             status: 'completed',
             processed_at: new Date().toISOString(),
             last_error: null,
+            processor_id: null,
+            processing_started_at: null,
+            claim_expires_at: null,
+            next_attempt_at: null,
         })
     } catch (error) {
-        await markWebhookEvent(env, row.event_id, { status: 'failed', last_error: truncateError(error) })
+        const retryAfterSeconds = computeRetryBackoffSeconds(claim.attempts)
+        await markWebhookEvent(env, eventId, {
+            status: 'failed',
+            last_error: truncateError(error),
+            processor_id: null,
+            processing_started_at: null,
+            claim_expires_at: null,
+            next_attempt_at: new Date(Date.now() + retryAfterSeconds * 1000).toISOString(),
+        })
+
+        logStripe('error', 'Stripe webhook processing failed', {
+            event_id: eventId,
+            processor_id: processorId,
+            attempts: claim.attempts,
+            retry_after_seconds: retryAfterSeconds,
+            error: truncateError(error),
+        })
     }
 }
 
 const retryWebhookEvents = async (env: Env) => {
     const supabase = getServiceSupabase(env)
-    const { data: rows, error } = await supabase
+    const nowIso = new Date().toISOString()
+    const batchSize = parseRetryBatchSize(env)
+
+    const { data: dueRows, error: dueError } = await supabase
         .from('stripe_webhook_events')
-        .select('event_id, payload, status, attempts')
+        .select('event_id')
         .in('status', ['pending', 'failed'])
         .lt('attempts', MAX_WEBHOOK_ATTEMPTS)
+        .or(`next_attempt_at.is.null,next_attempt_at.lte.${nowIso}`)
         .order('created_at', { ascending: true })
-        .limit(WEBHOOK_RETRY_BATCH_SIZE)
+        .limit(batchSize)
 
-    if (error) throw new Error(`Failed to fetch retryable webhook events: ${error.message}`)
+    if (dueError) throw new Error(`Failed to fetch retryable webhook events: ${dueError.message}`)
 
-    for (const row of (rows ?? []) as WebhookEventRow[]) {
-        if (!row.payload || typeof row.payload !== 'object') {
-            await markWebhookEvent(env, row.event_id, { status: 'failed', last_error: 'Stored payload is invalid for replay' })
-            continue
-        }
-        await processStoredWebhookEvent(env, row)
+    const remaining = Math.max(0, batchSize - (dueRows?.length ?? 0))
+    let staleRows: WebhookEventRow[] = []
+    if (remaining > 0) {
+        const { data: staleData, error: staleError } = await supabase
+            .from('stripe_webhook_events')
+            .select('event_id')
+            .eq('status', 'processing')
+            .lt('attempts', MAX_WEBHOOK_ATTEMPTS)
+            .or(`claim_expires_at.is.null,claim_expires_at.lt.${nowIso}`)
+            .order('created_at', { ascending: true })
+            .limit(remaining)
+
+        if (staleError) throw new Error(`Failed to fetch stale processing webhook events: ${staleError.message}`)
+        staleRows = (staleData ?? []) as WebhookEventRow[]
+    }
+
+    const ids = new Set<string>()
+    for (const row of (dueRows ?? []) as WebhookEventRow[]) ids.add(row.event_id)
+    for (const row of staleRows) ids.add(row.event_id)
+
+    for (const eventId of ids) {
+        await processWebhookEventById(env, eventId)
     }
 }
 
 const enforceGracePeriodDowngrades = async (env: Env) => {
     const supabase = getServiceSupabase(env)
     const nowIso = new Date().toISOString()
+    const batchSize = parseGraceBatchSize(env)
 
     const { data: rows, error } = await supabase
         .from('subscriptions')
@@ -615,7 +1039,7 @@ const enforceGracePeriodDowngrades = async (env: Env) => {
         .eq('status', 'past_due')
         .not('grace_period_end', 'is', null)
         .lte('grace_period_end', nowIso)
-        .limit(WEBHOOK_RETRY_BATCH_SIZE)
+        .limit(batchSize)
 
     if (error) throw new Error(`Failed to fetch expired grace-period subscriptions: ${error.message}`)
 
@@ -631,20 +1055,46 @@ const enforceGracePeriodDowngrades = async (env: Env) => {
             .eq('id', row.id)
 
         if (markError) {
-            console.error(`Failed to mark subscription ${row.id} canceled after grace period:`, markError)
+            logStripe('error', 'Failed to cancel subscription after grace period expiry', {
+                subscription_id: row.id,
+                error: markError.message,
+            })
             continue
         }
 
         try {
-            await ensureFreeSubscriptionForWorkspace(env, row.workspace_id)
+            await ensureFreeSubscriptionForWorkspace(env, row.workspace_id, 'grace-period-expired')
             await refreshWorkspacePlanCache(env, row.workspace_id)
-        } catch (error) {
-            console.error(`Failed to enforce grace-period downgrade for workspace ${row.workspace_id}:`, error)
+        } catch (downgradeError) {
+            logStripe('error', 'Failed to ensure free subscription after grace expiry', {
+                workspace_id: row.workspace_id,
+                error: truncateError(downgradeError),
+            })
         }
     }
 }
 
+const cleanupWebhookHistory = async (env: Env) => {
+    const supabase = getServiceSupabase(env)
+    const cutoffIso = new Date(Date.now() - DEFAULT_WEBHOOK_RETENTION_DAYS * 24 * 60 * 60 * 1000).toISOString()
+    const { error } = await supabase
+        .from('stripe_webhook_events')
+        .delete()
+        .eq('status', 'completed')
+        .lt('processed_at', cutoffIso)
+
+    if (error) throw new Error(`Failed to cleanup webhook history: ${error.message}`)
+}
+
+const ensureInternalCatalogSyncAuth = (env: Env, token: string | undefined) => {
+    if (!isNonEmptyString(env.STRIPE_INTERNAL_ADMIN_TOKEN)) return false
+    if (!isNonEmptyString(token)) return false
+    return token === env.STRIPE_INTERNAL_ADMIN_TOKEN
+}
+
 export const runStripeScheduled = async (env: Env, cron?: string) => {
+    const catalogSyncCron = getCatalogSyncCron(env)
+
     if (cron === WEBHOOK_RETRY_CRON) {
         await retryWebhookEvents(env)
         return
@@ -655,8 +1105,20 @@ export const runStripeScheduled = async (env: Env, cron?: string) => {
         return
     }
 
+    if (cron === catalogSyncCron) {
+        await syncStripeCatalog(env, { reason: 'scheduled-catalog-sync' })
+        return
+    }
+
+    if (cron === WEBHOOK_CLEANUP_CRON) {
+        await cleanupWebhookHistory(env)
+        return
+    }
+
     await retryWebhookEvents(env)
     await enforceGracePeriodDowngrades(env)
+    await syncStripeCatalog(env, { reason: 'fallback-scheduled-catalog-sync' })
+    await cleanupWebhookHistory(env)
 }
 
 stripeRouter.post(
@@ -667,6 +1129,22 @@ stripeRouter.post(
     async (c) => {
         const { workspaceId } = c.req.valid('param')
         const { plan_slug, interval } = c.req.valid('json')
+        const correlationId = createCorrelationId()
+
+        const headerValidation = stripeCheckoutIdempotencyHeaderSchema.safeParse({
+            'idempotency-key': c.req.header('idempotency-key') ?? c.req.header('Idempotency-Key'),
+        })
+        if (!headerValidation.success) {
+            return c.json({
+                error: 'Invalid idempotency header',
+                code: 'FIELD_VALIDATION_FAILED',
+                issues: headerValidation.error.issues.map((issue) => ({
+                    field_id: 'Idempotency-Key',
+                    message: issue.message,
+                })),
+            }, 400)
+        }
+        const clientIdempotencyKey = headerValidation.data['idempotency-key']
 
         const roleCheck = await enforceWorkspaceRole(c, workspaceId, 'admin')
         if (!roleCheck.ok) return roleCheck.response
@@ -675,7 +1153,7 @@ stripeRouter.post(
             return c.json({
                 error: 'Enterprise plan is not available via self-serve checkout',
                 code: 'CONTACT_SALES_REQUIRED',
-                contact_sales_url: c.env.CONTACT_SALES_URL,
+                contact_sales_url: c.env.CONTACT_SALES_URL || null,
             }, 403)
         }
 
@@ -693,7 +1171,6 @@ stripeRouter.post(
             'CHECKOUT_SUCCESS_URL',
             'CHECKOUT_CANCEL_URL',
             'BILLING_PORTAL_RETURN_URL',
-            'CONTACT_SALES_URL',
         ])
         if (missingEnv.length > 0) {
             return c.json({
@@ -705,7 +1182,7 @@ stripeRouter.post(
 
         try {
             const stripe = getStripeClient(c.env)
-            const activePaid = await findActivePaidSubscription(c.env, workspaceId)
+            const activePaid = await findEntitledPaidSubscription(c.env, workspaceId)
             const customerId = activePaid?.stripe_customer_id
                 ?? await ensureWorkspaceStripeCustomerId(c.env, workspaceId, c.get('user'), stripe)
 
@@ -725,7 +1202,148 @@ stripeRouter.post(
 
             const variant = await resolveCheckoutPlanVariant(c.env, plan_slug, interval)
             if (!variant.stripe_price_id) {
-                return c.json({ error: 'Plan variant is not configured for Stripe checkout' }, 500)
+                return c.json({
+                    error: 'Catalog is out of sync with Stripe',
+                    code: 'CATALOG_OUT_OF_SYNC',
+                    correlation_id: correlationId,
+                }, 409)
+            }
+
+            const requestFingerprint = await buildCheckoutRequestFingerprint(
+                workspaceId,
+                variant.id,
+                c.get('user')?.id ?? null
+            )
+            const stripeIdempotencyKey = await buildStripeCheckoutIdempotencyKey(
+                workspaceId,
+                variant.id,
+                clientIdempotencyKey
+            )
+            const supabase = getServiceSupabase(c.env)
+
+            const resolveExistingIdempotencyRow = async (
+                existingRow: CheckoutIdempotencyRow | null
+            ): Promise<Response | null> => {
+                if (!existingRow) return null
+
+                if (existingRow.request_fingerprint !== requestFingerprint) {
+                    return c.json({
+                        error: 'Idempotency key was reused with a different request payload',
+                        code: 'IDEMPOTENCY_KEY_REUSED_WITH_DIFFERENT_PAYLOAD',
+                        correlation_id: correlationId,
+                    }, 409)
+                }
+
+                if (isExpiredIso(existingRow.expires_at)) {
+                    return c.json({
+                        error: 'Idempotency key is expired. Generate a new key and retry.',
+                        code: 'IDEMPOTENCY_KEY_EXPIRED',
+                        correlation_id: correlationId,
+                    }, 409)
+                }
+
+                if (existingRow.status === 'completed' && existingRow.stripe_checkout_session_id) {
+                    const cachedUrl = existingRow.stripe_checkout_session_url
+                    if (cachedUrl) {
+                        return c.json({
+                            url: cachedUrl,
+                            session_id: existingRow.stripe_checkout_session_id,
+                            destination: 'checkout',
+                            idempotent_replay: true,
+                        }, 200)
+                    }
+
+                    const existingSession = await stripe.checkout.sessions.retrieve(existingRow.stripe_checkout_session_id)
+                    if (!existingSession.url) {
+                        throw new Error(`Stripe checkout session ${existingRow.stripe_checkout_session_id} is unavailable`)
+                    }
+
+                    await supabase
+                        .from('stripe_checkout_idempotency')
+                        .update({ stripe_checkout_session_url: existingSession.url })
+                        .eq('workspace_id', workspaceId)
+                        .eq('idempotency_key', clientIdempotencyKey)
+
+                    return c.json({
+                        url: existingSession.url,
+                        session_id: existingSession.id,
+                        destination: 'checkout',
+                        idempotent_replay: true,
+                    }, 200)
+                }
+
+                if (existingRow.status === 'in_progress') {
+                    return c.json({
+                        error: 'Checkout creation is already in progress for this idempotency key',
+                        code: 'CHECKOUT_IN_PROGRESS',
+                        correlation_id: correlationId,
+                    }, 409)
+                }
+
+                return null
+            }
+
+            let existing = await getCheckoutIdempotencyRow(c.env, workspaceId, clientIdempotencyKey)
+            let insertedFreshIdempotencyRow = false
+
+            const existingResponse = await resolveExistingIdempotencyRow(existing)
+            if (existingResponse) return existingResponse
+
+            if (!existing) {
+                const { error: insertIdempotencyError } = await supabase
+                    .from('stripe_checkout_idempotency')
+                    .insert({
+                        workspace_id: workspaceId,
+                        idempotency_key: clientIdempotencyKey,
+                        plan_variant_id: variant.id,
+                        request_fingerprint: requestFingerprint,
+                        stripe_idempotency_key: stripeIdempotencyKey,
+                        status: 'in_progress',
+                        expires_at: new Date(Date.now() + CHECKOUT_IDEMPOTENCY_TTL_MS).toISOString(),
+                    })
+
+                if (insertIdempotencyError && insertIdempotencyError.code !== '23505') {
+                    throw new Error(`Failed to create checkout idempotency row: ${insertIdempotencyError.message}`)
+                }
+
+                if (insertIdempotencyError?.code === '23505') {
+                    existing = await getCheckoutIdempotencyRow(c.env, workspaceId, clientIdempotencyKey)
+                    const racedExistingResponse = await resolveExistingIdempotencyRow(existing)
+                    if (racedExistingResponse) return racedExistingResponse
+                    if (!existing) {
+                        throw new Error('Checkout idempotency row conflicted but could not be reloaded')
+                    }
+                } else {
+                    insertedFreshIdempotencyRow = true
+                }
+            }
+
+            if (!insertedFreshIdempotencyRow) {
+                const nowIso = new Date().toISOString()
+                const { data: transitionedRow, error: markInProgressError } = await supabase
+                    .from('stripe_checkout_idempotency')
+                    .update({
+                        status: 'in_progress',
+                        last_error: null,
+                    })
+                    .eq('workspace_id', workspaceId)
+                    .eq('idempotency_key', clientIdempotencyKey)
+                    .eq('request_fingerprint', requestFingerprint)
+                    .neq('status', 'completed')
+                    .gt('expires_at', nowIso)
+                    .select('status')
+                    .maybeSingle()
+
+                if (markInProgressError) {
+                    throw new Error(`Failed to mark checkout idempotency row in_progress: ${markInProgressError.message}`)
+                }
+
+                if (!transitionedRow) {
+                    existing = await getCheckoutIdempotencyRow(c.env, workspaceId, clientIdempotencyKey)
+                    const postTransitionResponse = await resolveExistingIdempotencyRow(existing)
+                    if (postTransitionResponse) return postTransitionResponse
+                    throw new Error('Checkout idempotency row could not be transitioned to in_progress')
+                }
             }
 
             const session = await stripe.checkout.sessions.create({
@@ -733,7 +1351,7 @@ stripeRouter.post(
                 customer: customerId,
                 line_items: [{ price: variant.stripe_price_id, quantity: 1 }],
                 allow_promotion_codes: true,
-                automatic_tax: { enabled: false },
+                automatic_tax: { enabled: true },
                 success_url: c.env.CHECKOUT_SUCCESS_URL,
                 cancel_url: c.env.CHECKOUT_CANCEL_URL,
                 metadata: {
@@ -750,9 +1368,26 @@ stripeRouter.post(
                     },
                     trial_period_days: variant.trial_period_days > 0 ? variant.trial_period_days : undefined,
                 },
+            }, {
+                idempotencyKey: stripeIdempotencyKey,
             })
 
-            if (!session.url) return c.json({ error: 'Stripe did not return a checkout URL' }, 500)
+            if (!session.url) throw new Error('Stripe did not return a checkout URL')
+
+            const { error: completeRowError } = await supabase
+                .from('stripe_checkout_idempotency')
+                .update({
+                    status: 'completed',
+                    stripe_checkout_session_id: session.id,
+                    stripe_checkout_session_url: session.url,
+                    last_error: null,
+                })
+                .eq('workspace_id', workspaceId)
+                .eq('idempotency_key', clientIdempotencyKey)
+
+            if (completeRowError) {
+                throw new Error(`Failed to persist checkout completion in idempotency ledger: ${completeRowError.message}`)
+            }
 
             return c.json({
                 url: session.url,
@@ -760,8 +1395,32 @@ stripeRouter.post(
                 destination: 'checkout',
             }, 200)
         } catch (error) {
-            console.error('Stripe checkout session error:', error)
-            return c.json(toCheckoutErrorResponse(error), 500)
+            logStripe('error', 'Stripe checkout session error', {
+                correlation_id: correlationId,
+                workspace_id: workspaceId,
+                error: truncateError(error),
+            })
+
+            const supabase = getServiceSupabase(c.env)
+            await supabase
+                .from('stripe_checkout_idempotency')
+                .update({
+                    status: 'failed',
+                    last_error: truncateError(error),
+                })
+                .eq('workspace_id', workspaceId)
+                .eq('idempotency_key', clientIdempotencyKey)
+                .neq('status', 'completed')
+
+            if (error instanceof CatalogOutOfSyncError) {
+                return c.json({
+                    error: 'Catalog is out of sync with Stripe',
+                    code: error.code,
+                    correlation_id: correlationId,
+                }, 409)
+            }
+
+            return c.json(toCheckoutErrorResponse(correlationId), 500)
         }
     }
 )
@@ -772,6 +1431,7 @@ stripeRouter.post(
     zValidator('param', workspaceParamSchema),
     async (c) => {
         const { workspaceId } = c.req.valid('param')
+        const correlationId = createCorrelationId()
         const roleCheck = await enforceWorkspaceRole(c, workspaceId, 'admin')
         if (!roleCheck.ok) return roleCheck.response
 
@@ -780,7 +1440,6 @@ stripeRouter.post(
             'SUPABASE_SERVICE_ROLE_KEY',
             'STRIPE_SECRET_KEY',
             'BILLING_PORTAL_RETURN_URL',
-            'CONTACT_SALES_URL',
         ])
         if (missingEnv.length > 0) {
             return c.json({
@@ -801,17 +1460,67 @@ stripeRouter.post(
 
             return c.json({ url: session.url }, 200)
         } catch (error) {
-            console.error('Stripe portal session error:', error)
-            return c.json(toPortalErrorResponse(error), 500)
+            logStripe('error', 'Stripe portal session error', {
+                correlation_id: correlationId,
+                workspace_id: workspaceId,
+                error: truncateError(error),
+            })
+            return c.json(toPortalErrorResponse(correlationId), 500)
         }
     }
 )
+
+stripeRouter.post('/catalog/sync', async (c) => {
+    const adminToken = c.req.header('x-internal-admin-token') ?? c.req.header('authorization')?.replace(/^Bearer\s+/i, '')
+    if (!ensureInternalCatalogSyncAuth(c.env, adminToken)) {
+        return c.json({ error: 'Forbidden' }, 403)
+    }
+
+    try {
+        const result = await syncStripeCatalog(c.env, { forced: true, reason: 'manual-api' })
+        return c.json({
+            success: true,
+            result,
+        }, 200)
+    } catch (error) {
+        const correlationId = createCorrelationId()
+        logStripe('error', 'Manual catalog sync failed', {
+            correlation_id: correlationId,
+            error: truncateError(error),
+        })
+        return c.json({
+            error: 'Failed to sync Stripe catalog',
+            code: 'CATALOG_SYNC_FAILED',
+            correlation_id: correlationId,
+        }, 500)
+    }
+})
 
 stripeRouter.post('/webhook', async (c) => {
     const signature = c.req.header('stripe-signature')
     if (!signature) return c.json({ error: 'Missing Stripe signature' }, 400)
 
+    const maxBytes = parseWebhookMaxBodyBytes(c.env)
+    const contentLengthHeader = c.req.header('content-length')
+    const contentLength = contentLengthHeader ? Number.parseInt(contentLengthHeader, 10) : null
+    if (contentLength !== null && Number.isFinite(contentLength) && contentLength > maxBytes) {
+        logStripe('warn', 'Webhook rejected due to content-length guard', {
+            content_length: contentLength,
+            max_bytes: maxBytes,
+        })
+        return c.json({ error: 'Webhook payload too large' }, 413)
+    }
+
     const payload = await c.req.text()
+    const payloadBytes = new TextEncoder().encode(payload).byteLength
+    if (payloadBytes > maxBytes) {
+        logStripe('warn', 'Webhook rejected due to payload byte-size guard', {
+            payload_bytes: payloadBytes,
+            max_bytes: maxBytes,
+        })
+        return c.json({ error: 'Webhook payload too large' }, 413)
+    }
+
     const stripe = getStripeClient(c.env)
     let event: Stripe.Event
 
@@ -824,7 +1533,9 @@ stripeRouter.post('/webhook', async (c) => {
             stripeCryptoProvider
         )
     } catch (error) {
-        console.error('Stripe signature verification failed:', error)
+        logStripe('warn', 'Stripe signature verification failed', {
+            error: truncateError(error),
+        })
         return c.json({ error: 'Invalid Stripe signature' }, 400)
     }
 
@@ -837,6 +1548,7 @@ stripeRouter.post('/webhook', async (c) => {
             payload: event,
             status: 'pending',
             attempts: 0,
+            next_attempt_at: null,
         })
 
     if (insertError?.code === '23505') {
@@ -844,11 +1556,15 @@ stripeRouter.post('/webhook', async (c) => {
     }
 
     if (insertError) {
-        console.error('Stripe webhook insert failed:', insertError)
+        logStripe('error', 'Stripe webhook insert failed', {
+            event_id: event.id,
+            event_type: event.type,
+            error: insertError.message,
+        })
         return c.json({ error: 'Failed to persist webhook event' }, 500)
     }
 
-    c.executionCtx.waitUntil(processNewWebhookEvent(c.env, event))
+    c.executionCtx.waitUntil(processWebhookEventById(c.env, event.id))
     return c.json({ received: true }, 200)
 })
 

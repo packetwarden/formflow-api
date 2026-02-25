@@ -423,35 +423,57 @@ Additional hardening in `src/routes/f/index.ts`:
    - `{ "error": "Failed to submit form", "code": "RUNNER_INTERNAL_ERROR" }`
 4. `@hono/zod-validator` remains in use for both route param and JSON body validation.
 
-## 8B. Stripe Billing API v1 (Implemented)
+## 8B. Stripe Billing API v2 (Crash-Safe, Drift-Safe, Concurrency-Safe)
 Stripe router file: `src/routes/stripe/index.ts`
 
 Endpoints:
 1. `POST /api/v1/stripe/workspaces/:workspaceId/checkout-session`
 2. `POST /api/v1/stripe/workspaces/:workspaceId/portal-session`
 3. `POST /api/v1/stripe/webhook`
+4. `POST /api/v1/stripe/catalog/sync` (internal token-protected)
 
 Checkout + portal behavior:
 1. both session endpoints require authenticated owner/admin workspace role
 2. self-serve checkout supports paid tiers only (`pro`, `business`)
 3. enterprise checkout is blocked with `CONTACT_SALES_REQUIRED`
-4. if a workspace already has active paid subscription, checkout endpoint returns portal URL with:
+4. checkout requires `Idempotency-Key` UUID header and stores attempt state in `stripe_checkout_idempotency`
+5. idempotency outcomes:
+   - same key + same payload + under 24 hours returns cached checkout session
+   - same key + different payload returns `IDEMPOTENCY_KEY_REUSED_WITH_DIFFERENT_PAYLOAD`
+   - same key after 24 hours returns `IDEMPOTENCY_KEY_EXPIRED`
+6. if a workspace already has active paid subscription, checkout endpoint returns portal URL with:
    - `destination: "portal"`
    - `reason: "ALREADY_SUBSCRIBED"`
-5. checkout session uses hosted Stripe Checkout subscription mode with:
-   - promotion codes enabled
-   - automatic tax enabled
-   - optional trial days from `plan_variants.trial_period_days`
-   - metadata (`workspace_id`, `plan_variant_id`, `requested_by_user_id`)
+7. checkout session uses hosted Stripe Checkout subscription mode with:
+    - promotion codes enabled
+    - `automatic_tax.enabled = true`
+    - optional trial days from `plan_variants.trial_period_days`
+    - metadata (`workspace_id`, `plan_variant_id`, `requested_by_user_id`)
+8. checkout can return `CATALOG_OUT_OF_SYNC` when Stripe price mappings cannot be reconciled
+9. checkout error responses return stable app `code` values; Stripe internals stay server-side and include `correlation_id` for traceability
+10. one Stripe customer is enforced per workspace in `workspace_billing_customers`
+
+Catalog sync behavior:
+1. Stripe is source-of-truth for recurring sellable prices
+2. sync maps Stripe -> DB via metadata/lookup key convention:
+   - lookup key: `formsandbox:{env}:{plan_slug}:{interval}:usd`
+   - metadata: `plan_slug`, `interval`, `self_serve`
+3. default scheduled sync cron is `*/15 * * * *` (env override: `STRIPE_CATALOG_SYNC_CRON`)
+4. webhook unknown `price_id` path attempts one forced sync + retry before marking failed
 
 Webhook behavior:
 1. verifies `stripe-signature` using Stripe SDK `constructEventAsync`
-2. inserts `event_id` idempotently into `stripe_webhook_events`
-3. duplicate event inserts return `200` without reprocessing
-4. accepted events are processed asynchronously via `waitUntil`
-5. subscription state sync updates:
+2. enforces payload size guard before parse (`STRIPE_WEBHOOK_MAX_BODY_BYTES`)
+3. inserts `event_id` idempotently into `stripe_webhook_events`
+4. duplicate event inserts return `200` without reprocessing
+5. accepted events are processed asynchronously via lease-based claim processing:
+   - claim due `pending|failed`
+   - reclaim stale `processing` by expired `claim_expires_at` (and legacy `NULL` claim rows)
+6. subscription state sync updates:
    - `subscriptions` (source of truth)
    - `workspaces.plan` cache
+7. `invoice.payment_failed` / `invoice.paid` update `grace_period_end` only (no forced status overwrite)
+8. `unpaid`, `paused`, and `canceled` statuses immediately ensure free-tier subscription
 
 Webhook event coverage:
 1. `checkout.session.completed`
@@ -463,10 +485,15 @@ Webhook event coverage:
 
 Scheduled jobs (Worker `scheduled` handler):
 1. webhook replay pass (`*/5 * * * *`):
-   - retries `pending|failed` rows under attempt cap
+   - retries due `pending|failed` rows under attempt cap
+   - reclaims stale `processing` rows
 2. grace-period downgrade pass (`0 * * * *`):
    - downgrades expired `past_due` subscriptions to free
    - refreshes `workspaces.plan`
+3. catalog sync pass (`*/15 * * * *` by default):
+   - syncs Stripe recurring prices into active `plan_variants`
+4. webhook cleanup pass (`30 2 * * *`):
+   - purges completed webhook rows older than retention window
 
 ## 9. Validation Catalog
 Validation file: `src/utils/validation.ts`
@@ -489,6 +516,10 @@ Runner schemas:
 1. `runnerFormParamSchema`
 2. `runnerSubmitBodySchema`
 3. `runnerIdempotencyHeaderSchema`
+
+Stripe schemas:
+1. `stripeCheckoutSessionSchema`
+2. `stripeCheckoutIdempotencyHeaderSchema`
 
 ## 10. Database Contract Updates in V2
 Schema file: `project-info-docs/formflow_beta_schema_v2.sql`
@@ -521,6 +552,7 @@ Migration source file:
 2. `project-info-docs/migrations/2026-02-23_runner_public_api_v1.sql`
 3. `project-info-docs/migrations/2026-02-24_runner_strict_submit_rate_limit.sql`
 4. `project-info-docs/migrations/2026-02-24_stripe_checkout_portal_v1.sql`
+5. `project-info-docs/migrations/2026-02-25_stripe_billing_hardening_v2.sql`
 
 ## 11. Implementation Files Added or Updated
 Updated:
@@ -542,9 +574,10 @@ Added:
 2. `project-info-docs/migrations/2026-02-23_runner_public_api_v1.sql`
 3. `project-info-docs/migrations/2026-02-24_runner_strict_submit_rate_limit.sql`
 4. `project-info-docs/migrations/2026-02-24_stripe_checkout_portal_v1.sql`
-5. `project-info-docs/stripe-implementation.md`
-6. `runner-api-beta.md`
-7. `test-runner-public-v1.md`
+5. `project-info-docs/migrations/2026-02-25_stripe_billing_hardening_v2.sql`
+6. `project-info-docs/stripe-implementation.md`
+7. `runner-api-beta.md`
+8. `test-runner-public-v1.md`
 
 ## 12. Operational Runbook
 For fresh database setup:
@@ -556,7 +589,14 @@ For existing V1 environments:
 2. execute `project-info-docs/migrations/2026-02-23_runner_public_api_v1.sql`
 3. execute `project-info-docs/migrations/2026-02-24_runner_strict_submit_rate_limit.sql`
 4. execute `project-info-docs/migrations/2026-02-24_stripe_checkout_portal_v1.sql`
-5. verify function privileges and runner behavior
+5. execute `project-info-docs/migrations/2026-02-25_stripe_billing_hardening_v2.sql`
+6. verify function privileges, webhook lease reclaim, and checkout idempotency behavior
+
+Emergency rollback (Stripe v2 -> Stripe v1):
+1. roll back backend code to the last Stripe v1 git revision
+2. execute `project-info-docs/migrations/2026-02-25_stripe_billing_hardening_v2_rollback_to_v1.sql`
+3. if rollback blocks on duplicate active-like subscriptions, resolve duplicates per script hint and rerun
+4. verify checkout/portal/webhook flows with `test-stripe-v1.md` v1-compatible subset
 
 Recommended verification SQL:
 ```sql
@@ -569,7 +609,9 @@ WHERE routine_schema = 'public'
       'submit_form',
       'check_request',
       'get_published_form_by_id',
-      'get_form_submission_quota'
+      'get_form_submission_quota',
+      'ensure_free_subscription_for_workspace',
+      'claim_stripe_webhook_event'
   );
 ```
 
@@ -601,7 +643,7 @@ npm run deploy
 
 ## 14. Known Gaps and Next Targets
 Planned next backend milestones:
-1. automated Stripe test matrix (webhook fixtures + end-to-end checkout/portal simulation)
+1. automated Stripe test matrix (webhook fixtures + end-to-end checkout/portal simulation + crash-lease reclaim)
 2. optional worker-side entitlement KV cache for high-throughput runner traffic
 3. expanded runner schema contract support for advanced field types/actions (deferred)
 
@@ -611,3 +653,9 @@ When backend behavior changes:
 2. update `changelog.md`
 3. if SQL contract changed, update schema baseline and migration docs
 4. keep schema policy section current (active version pointer)
+
+## 16. Frontend Integration (Stripe v2)
+1. Frontend must generate a new UUID `Idempotency-Key` for each checkout attempt.
+2. Frontend may retry with the same key only for the same plan/interval payload.
+3. Frontend must rotate the key after 24 hours (server returns `IDEMPOTENCY_KEY_EXPIRED`).
+4. Frontend must never reuse the same key for a different payload (server returns `IDEMPOTENCY_KEY_REUSED_WITH_DIFFERENT_PAYLOAD`).
