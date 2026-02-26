@@ -16,6 +16,7 @@ Before touching Dashboard, confirm:
 2. Database migration is applied:
     - `project-info-docs/migrations/2026-02-24_stripe_checkout_portal_v1.sql`
     - `project-info-docs/migrations/2026-02-25_stripe_billing_hardening_v2.sql`
+    - `project-info-docs/migrations/2026-02-26_stripe_customer_mapping_recovery_v3.sql`
 3. You know your environment webhook URLs:
    - staging: `https://<staging-domain>/api/v1/stripe/webhook`
    - production: `https://<prod-domain>/api/v1/stripe/webhook`
@@ -110,10 +111,11 @@ Create webhook endpoints per environment.
 2. Add endpoint URL:
    - `https://<staging-domain>/api/v1/stripe/webhook`
 3. Select events:
-   - `checkout.session.completed`
-   - `customer.subscription.created`
-   - `customer.subscription.updated`
-   - `customer.subscription.deleted`
+    - `checkout.session.completed`
+    - `customer.deleted`
+    - `customer.subscription.created`
+    - `customer.subscription.updated`
+    - `customer.subscription.deleted`
    - `invoice.payment_failed`
    - `invoice.paid`
 4. Save endpoint and copy signing secret (`whsec_...`).
@@ -171,6 +173,12 @@ After dashboard setup, verify DB mappings:
 6. `stripe_webhook_events`:
    - lease columns exist (`processor_id`, `processing_started_at`, `claim_expires_at`, `next_attempt_at`)
    - retry/reclaim indexes exist after v2 migration
+7. `workspace_billing_customer_events`:
+   - events are written for `validated`, `invalidated`, `recreated`, `webhook_deleted`
+
+Operational note:
+1. `/api/v1/stripe/catalog/sync` updates `plan_variants` pricing data only.
+2. Customer mapping recovery is handled in checkout/portal flows and `customer.deleted` webhook processing.
 
 ## 9) Frontend Checkout Idempotency Rules
 1. Frontend must send `Idempotency-Key` (UUID) for checkout session requests.
@@ -209,7 +217,7 @@ Do this in order:
 ## 12) Common Mistakes to Avoid
 1. Mixing test `price_...` IDs in production DB.
 2. Using wrong webhook secret for environment.
-3. Forgetting to include `customer.subscription.deleted` event.
+3. Forgetting to include `customer.deleted` and `customer.subscription.deleted` events.
 4. Allowing enterprise price in self-serve flow.
 5. Not setting portal cancellation to end-of-period when policy requires it.
 6. Missing tax registration setup while `automatic_tax` is enabled.

@@ -423,7 +423,7 @@ Additional hardening in `src/routes/f/index.ts`:
    - `{ "error": "Failed to submit form", "code": "RUNNER_INTERNAL_ERROR" }`
 4. `@hono/zod-validator` remains in use for both route param and JSON body validation.
 
-## 8B. Stripe Billing API v2 (Crash-Safe, Drift-Safe, Concurrency-Safe)
+## 8B. Stripe Billing API v3 (Crash-Safe, Drift-Safe, Customer-Recovery-Safe)
 Stripe router file: `src/routes/stripe/index.ts`
 
 Endpoints:
@@ -452,6 +452,13 @@ Checkout + portal behavior:
 8. checkout can return `CATALOG_OUT_OF_SYNC` when Stripe price mappings cannot be reconciled
 9. checkout error responses return stable app `code` values; Stripe internals stay server-side and include `correlation_id` for traceability
 10. one Stripe customer is enforced per workspace in `workspace_billing_customers`
+11. checkout/portal validate mapped `stripe_customer_id` against Stripe before session creation
+12. if mapped customer is deleted/missing, service invalidates mapping, recreates customer, and retries session creation once
+13. customer mapping audit entries are written to `workspace_billing_customer_events` with event types:
+   - `validated`
+   - `invalidated`
+   - `recreated`
+   - `webhook_deleted`
 
 Catalog sync behavior:
 1. Stripe is source-of-truth for recurring sellable prices
@@ -460,6 +467,7 @@ Catalog sync behavior:
    - metadata: `plan_slug`, `interval`, `self_serve`
 3. default scheduled sync cron is `*/15 * * * *` (env override: `STRIPE_CATALOG_SYNC_CRON`)
 4. webhook unknown `price_id` path attempts one forced sync + retry before marking failed
+5. `/api/v1/stripe/catalog/sync` is catalog-only and does not repair workspace customer mappings
 
 Webhook behavior:
 1. verifies `stripe-signature` using Stripe SDK `constructEventAsync`
@@ -477,11 +485,12 @@ Webhook behavior:
 
 Webhook event coverage:
 1. `checkout.session.completed`
-2. `customer.subscription.created`
-3. `customer.subscription.updated`
-4. `customer.subscription.deleted`
-5. `invoice.payment_failed`
-6. `invoice.paid`
+2. `customer.deleted`
+3. `customer.subscription.created`
+4. `customer.subscription.updated`
+5. `customer.subscription.deleted`
+6. `invoice.payment_failed`
+7. `invoice.paid`
 
 Scheduled jobs (Worker `scheduled` handler):
 1. webhook replay pass (`*/5 * * * *`):
@@ -553,6 +562,7 @@ Migration source file:
 3. `project-info-docs/migrations/2026-02-24_runner_strict_submit_rate_limit.sql`
 4. `project-info-docs/migrations/2026-02-24_stripe_checkout_portal_v1.sql`
 5. `project-info-docs/migrations/2026-02-25_stripe_billing_hardening_v2.sql`
+6. `project-info-docs/migrations/2026-02-26_stripe_customer_mapping_recovery_v3.sql`
 
 ## 11. Implementation Files Added or Updated
 Updated:
@@ -575,9 +585,10 @@ Added:
 3. `project-info-docs/migrations/2026-02-24_runner_strict_submit_rate_limit.sql`
 4. `project-info-docs/migrations/2026-02-24_stripe_checkout_portal_v1.sql`
 5. `project-info-docs/migrations/2026-02-25_stripe_billing_hardening_v2.sql`
-6. `project-info-docs/stripe-implementation.md`
-7. `runner-api-beta.md`
-8. `test-runner-public-v1.md`
+6. `project-info-docs/migrations/2026-02-26_stripe_customer_mapping_recovery_v3.sql`
+7. `project-info-docs/stripe-implementation.md`
+8. `runner-api-beta.md`
+9. `test-runner-public-v1.md`
 
 ## 12. Operational Runbook
 For fresh database setup:
@@ -590,7 +601,8 @@ For existing V1 environments:
 3. execute `project-info-docs/migrations/2026-02-24_runner_strict_submit_rate_limit.sql`
 4. execute `project-info-docs/migrations/2026-02-24_stripe_checkout_portal_v1.sql`
 5. execute `project-info-docs/migrations/2026-02-25_stripe_billing_hardening_v2.sql`
-6. verify function privileges, webhook lease reclaim, and checkout idempotency behavior
+6. execute `project-info-docs/migrations/2026-02-26_stripe_customer_mapping_recovery_v3.sql`
+7. verify function privileges, webhook lease reclaim, checkout idempotency, and customer-recovery audit behavior
 
 Emergency rollback (Stripe v2 -> Stripe v1):
 1. roll back backend code to the last Stripe v1 git revision

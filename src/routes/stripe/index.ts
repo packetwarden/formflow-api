@@ -70,6 +70,15 @@ type CheckoutIdempotencyRow = {
     status: 'in_progress' | 'completed' | 'failed'
     expires_at: string
 }
+type WorkspaceBillingCustomerRow = {
+    workspace_id: string
+    stripe_customer_id: string
+}
+type WorkspaceBillingCustomerEventType = 'validated' | 'invalidated' | 'recreated' | 'webhook_deleted'
+type ResolveWorkspaceStripeCustomerOutcome = {
+    customerId: string
+    status: 'validated' | 'recreated'
+}
 type RequiredBillingEnvKey =
     | 'SUPABASE_URL'
     | 'SUPABASE_SERVICE_ROLE_KEY'
@@ -234,6 +243,60 @@ const buildStripeCheckoutIdempotencyKey = async (
     if (raw.length <= 255) return raw
     const hash = await digestSha256Hex(raw)
     return `checkout:v1:${workspaceId}:${planVariantId}:${hash}`
+}
+
+const buildStripeCustomerCreateIdempotencyKey = async (
+    workspaceId: string,
+    requestScopeKey: string
+) => {
+    const raw = `customer:v2:${workspaceId}:${requestScopeKey}`
+    if (raw.length <= 255) return raw
+    const hash = await digestSha256Hex(raw)
+    return `customer:v2:${workspaceId}:${hash}`
+}
+
+const isDeletedStripeCustomer = (
+    customer: Stripe.Customer | Stripe.DeletedCustomer
+): customer is Stripe.DeletedCustomer =>
+    'deleted' in customer && customer.deleted === true
+
+const isStripeCustomerMissingError = (
+    error: unknown,
+    customerId?: string | null
+) => {
+    if (!error || typeof error !== 'object') return false
+
+    const stripeError = error as {
+        type?: unknown
+        code?: unknown
+        param?: unknown
+        message?: unknown
+    }
+
+    const type = typeof stripeError.type === 'string' ? stripeError.type : null
+    const code = typeof stripeError.code === 'string' ? stripeError.code : null
+    const param = typeof stripeError.param === 'string' ? stripeError.param : null
+    const message = typeof stripeError.message === 'string' ? stripeError.message : ''
+
+    if (type === 'invalid_request_error' && code === 'resource_missing' && param === 'customer') {
+        return true
+    }
+
+    if (code === 'resource_missing' && message.includes('No such customer')) {
+        return true
+    }
+
+    if (customerId && message.includes(customerId) && message.includes('No such customer')) {
+        return true
+    }
+
+    return false
+}
+
+const getStripeRequestIdFromError = (error: unknown) => {
+    if (!error || typeof error !== 'object') return null
+    const requestId = (error as { requestId?: unknown }).requestId
+    return typeof requestId === 'string' ? requestId : null
 }
 
 const isExpiredIso = (value: string) => {
@@ -583,31 +646,131 @@ const resolveCheckoutPlanVariant = async (
     throw new CatalogOutOfSyncError(`Plan variant "${planSlug}:${interval}" is out of sync with Stripe`)
 }
 
-const ensureWorkspaceStripeCustomerId = async (
+const recordWorkspaceBillingCustomerEvent = async (
     env: Env,
-    workspaceId: string,
-    user: Variables['user'],
-    stripe: Stripe
+    event: {
+        workspaceId: string
+        eventType: WorkspaceBillingCustomerEventType
+        oldStripeCustomerId?: string | null
+        newStripeCustomerId?: string | null
+        reason?: string | null
+        stripeEventId?: string | null
+    }
 ) => {
     const supabase = getServiceSupabase(env)
-    const { data: mapping, error: mappingError } = await supabase
+    const { error } = await supabase
+        .from('workspace_billing_customer_events')
+        .insert({
+            workspace_id: event.workspaceId,
+            event_type: event.eventType,
+            old_stripe_customer_id: event.oldStripeCustomerId ?? null,
+            new_stripe_customer_id: event.newStripeCustomerId ?? null,
+            reason: event.reason ?? null,
+            stripe_event_id: event.stripeEventId ?? null,
+        })
+
+    if (error) {
+        logStripe('warn', 'Failed to persist workspace billing customer event', {
+            workspace_id: event.workspaceId,
+            event_type: event.eventType,
+            old_stripe_customer_id: event.oldStripeCustomerId ?? null,
+            new_stripe_customer_id: event.newStripeCustomerId ?? null,
+            reason: event.reason ?? null,
+            stripe_event_id: event.stripeEventId ?? null,
+            error: error.message,
+        })
+    }
+}
+
+const getWorkspaceBillingCustomerMapping = async (
+    env: Env,
+    workspaceId: string
+) => {
+    const supabase = getServiceSupabase(env)
+    const { data, error } = await supabase
         .from('workspace_billing_customers')
-        .select('stripe_customer_id')
+        .select('workspace_id, stripe_customer_id')
         .eq('workspace_id', workspaceId)
         .maybeSingle()
 
-    if (mappingError && mappingError.code !== 'PGRST116') {
-        throw new Error(`Failed to load workspace billing customer mapping: ${mappingError.message}`)
+    if (error && error.code !== 'PGRST116') {
+        throw new Error(`Failed to load workspace billing customer mapping: ${error.message}`)
     }
 
-    if (mapping?.stripe_customer_id) return mapping.stripe_customer_id
+    return (data ?? null) as WorkspaceBillingCustomerRow | null
+}
+
+const persistWorkspaceStripeCustomerMapping = async (
+    env: Env,
+    workspaceId: string,
+    stripeCustomerId: string
+) => {
+    const supabase = getServiceSupabase(env)
+    const { error } = await supabase
+        .from('workspace_billing_customers')
+        .upsert({
+            workspace_id: workspaceId,
+            stripe_customer_id: stripeCustomerId,
+        }, {
+            onConflict: 'workspace_id',
+        })
+
+    if (error) {
+        throw new Error(`Failed to persist workspace billing customer mapping: ${error.message}`)
+    }
+}
+
+const invalidateWorkspaceStripeCustomerMapping = async (
+    env: Env,
+    workspaceId: string,
+    stripeCustomerId: string,
+    reason: string
+) => {
+    const supabase = getServiceSupabase(env)
+    const { data, error } = await supabase
+        .from('workspace_billing_customers')
+        .delete()
+        .eq('workspace_id', workspaceId)
+        .eq('stripe_customer_id', stripeCustomerId)
+        .select('workspace_id, stripe_customer_id')
+
+    if (error) {
+        throw new Error(`Failed to invalidate workspace billing customer mapping: ${error.message}`)
+    }
+
+    const deletedRows = (data ?? []) as WorkspaceBillingCustomerRow[]
+    if (deletedRows.length > 0) {
+        await recordWorkspaceBillingCustomerEvent(env, {
+            workspaceId,
+            eventType: 'invalidated',
+            oldStripeCustomerId: stripeCustomerId,
+            reason,
+        })
+        return true
+    }
+
+    return false
+}
+
+const createWorkspaceStripeCustomerMapping = async (
+    env: Env,
+    workspaceId: string,
+    user: Variables['user'],
+    stripe: Stripe,
+    requestScopeKey: string
+) => {
+    const supabase = getServiceSupabase(env)
+    const customerCreateIdempotencyKey = await buildStripeCustomerCreateIdempotencyKey(
+        workspaceId,
+        requestScopeKey
+    )
 
     const customer = await stripe.customers.create({
         email: user?.email ?? undefined,
         name: typeof user?.user_metadata?.full_name === 'string' ? user.user_metadata.full_name : undefined,
         metadata: { workspace_id: workspaceId },
     }, {
-        idempotencyKey: `customer:v1:${workspaceId}`,
+        idempotencyKey: customerCreateIdempotencyKey,
     })
 
     const { error: insertMappingError } = await supabase
@@ -621,6 +784,7 @@ const ensureWorkspaceStripeCustomerId = async (
         throw new Error(`Failed to persist workspace billing customer mapping: ${insertMappingError.message}`)
     }
 
+    let customerId = customer.id
     if (insertMappingError?.code === '23505') {
         const { data: raceWinner, error: raceWinnerError } = await supabase
             .from('workspace_billing_customers')
@@ -630,12 +794,12 @@ const ensureWorkspaceStripeCustomerId = async (
         if (raceWinnerError || !raceWinner?.stripe_customer_id) {
             throw new Error(`Failed to resolve raced customer mapping: ${raceWinnerError?.message ?? 'missing mapping'}`)
         }
-        return raceWinner.stripe_customer_id
+        customerId = raceWinner.stripe_customer_id
     }
 
     const { error: syncCustomerError } = await supabase
         .from('subscriptions')
-        .update({ stripe_customer_id: customer.id })
+        .update({ stripe_customer_id: customerId })
         .eq('workspace_id', workspaceId)
         .is('stripe_customer_id', null)
 
@@ -643,7 +807,196 @@ const ensureWorkspaceStripeCustomerId = async (
         throw new Error(`Failed to sync stripe_customer_id into subscriptions: ${syncCustomerError.message}`)
     }
 
-    return customer.id
+    return customerId
+}
+
+const resolveOrCreateWorkspaceStripeCustomerId = async (
+    env: Env,
+    workspaceId: string,
+    user: Variables['user'],
+    stripe: Stripe,
+    requestScopeKey: string
+): Promise<ResolveWorkspaceStripeCustomerOutcome> => {
+    const mapping = await getWorkspaceBillingCustomerMapping(env, workspaceId)
+
+    if (mapping?.stripe_customer_id) {
+        try {
+            const stripeCustomer = await stripe.customers.retrieve(mapping.stripe_customer_id)
+            if (!isDeletedStripeCustomer(stripeCustomer)) {
+                await recordWorkspaceBillingCustomerEvent(env, {
+                    workspaceId,
+                    eventType: 'validated',
+                    oldStripeCustomerId: mapping.stripe_customer_id,
+                    newStripeCustomerId: mapping.stripe_customer_id,
+                    reason: 'stripe-retrieve-ok',
+                })
+                return {
+                    customerId: mapping.stripe_customer_id,
+                    status: 'validated',
+                }
+            }
+
+            await invalidateWorkspaceStripeCustomerMapping(
+                env,
+                workspaceId,
+                mapping.stripe_customer_id,
+                'stripe-retrieve-deleted-customer'
+            )
+        } catch (error) {
+            if (!isStripeCustomerMissingError(error, mapping.stripe_customer_id)) {
+                throw error
+            }
+
+            logStripe('warn', 'Workspace billing customer mapping points to missing Stripe customer', {
+                workspace_id: workspaceId,
+                stripe_customer_id: mapping.stripe_customer_id,
+                stripe_request_id: getStripeRequestIdFromError(error),
+                error: truncateError(error),
+            })
+
+            await invalidateWorkspaceStripeCustomerMapping(
+                env,
+                workspaceId,
+                mapping.stripe_customer_id,
+                'stripe-resource-missing-customer'
+            )
+        }
+    }
+
+    const customerId = await createWorkspaceStripeCustomerMapping(
+        env,
+        workspaceId,
+        user,
+        stripe,
+        requestScopeKey
+    )
+
+    await recordWorkspaceBillingCustomerEvent(env, {
+        workspaceId,
+        eventType: 'recreated',
+        oldStripeCustomerId: mapping?.stripe_customer_id ?? null,
+        newStripeCustomerId: customerId,
+        reason: mapping?.stripe_customer_id
+            ? 'stale-mapping-recovery'
+            : 'missing-mapping-create',
+    })
+
+    return {
+        customerId,
+        status: 'recreated',
+    }
+}
+
+const withRecoveredWorkspaceStripeCustomer = async <T>(
+    env: Env,
+    workspaceId: string,
+    user: Variables['user'],
+    stripe: Stripe,
+    options: {
+        requestScopeKey: string
+        correlationId: string
+        operation: 'checkout-session' | 'portal-session'
+        preferredCustomerId?: string | null
+    },
+    execute: (customerId: string) => Promise<T>
+) => {
+    // Validate once before execution and retry once if Stripe rejects the customer reference.
+    let firstResolution: ResolveWorkspaceStripeCustomerOutcome | null = null
+    if (options.preferredCustomerId) {
+        try {
+            const preferred = await stripe.customers.retrieve(options.preferredCustomerId)
+            if (isDeletedStripeCustomer(preferred)) {
+                await invalidateWorkspaceStripeCustomerMapping(
+                    env,
+                    workspaceId,
+                    options.preferredCustomerId,
+                    `${options.operation}-preferred-customer-deleted`
+                )
+            } else {
+                await persistWorkspaceStripeCustomerMapping(
+                    env,
+                    workspaceId,
+                    options.preferredCustomerId
+                )
+                await recordWorkspaceBillingCustomerEvent(env, {
+                    workspaceId,
+                    eventType: 'validated',
+                    oldStripeCustomerId: options.preferredCustomerId,
+                    newStripeCustomerId: options.preferredCustomerId,
+                    reason: `${options.operation}-preferred-customer-valid`,
+                })
+                firstResolution = {
+                    customerId: options.preferredCustomerId,
+                    status: 'validated',
+                }
+            }
+        } catch (error) {
+            if (!isStripeCustomerMissingError(error, options.preferredCustomerId)) {
+                throw error
+            }
+
+            logStripe('warn', 'Preferred Stripe customer is missing; falling back to workspace mapping recovery', {
+                workspace_id: workspaceId,
+                operation: options.operation,
+                stripe_customer_id: options.preferredCustomerId,
+                stripe_request_id: getStripeRequestIdFromError(error),
+                correlation_id: options.correlationId,
+                error: truncateError(error),
+            })
+
+            await invalidateWorkspaceStripeCustomerMapping(
+                env,
+                workspaceId,
+                options.preferredCustomerId,
+                `${options.operation}-preferred-customer-missing`
+            )
+        }
+    }
+
+    if (!firstResolution) {
+        firstResolution = await resolveOrCreateWorkspaceStripeCustomerId(
+            env,
+            workspaceId,
+            user,
+            stripe,
+            options.requestScopeKey
+        )
+    }
+
+    try {
+        return await execute(firstResolution.customerId)
+    } catch (error) {
+        if (!isStripeCustomerMissingError(error, firstResolution.customerId)) {
+            throw error
+        }
+
+        logStripe('warn', 'Stripe session operation failed due to missing customer; retrying with remapped customer', {
+            workspace_id: workspaceId,
+            operation: options.operation,
+            stripe_customer_id: firstResolution.customerId,
+            stripe_request_id: getStripeRequestIdFromError(error),
+            correlation_id: options.correlationId,
+            error: truncateError(error),
+        })
+
+        await invalidateWorkspaceStripeCustomerMapping(
+            env,
+            workspaceId,
+            firstResolution.customerId,
+            `${options.operation}-missing-customer-retry`
+        )
+
+        const retryRequestScopeKey = `${options.requestScopeKey}:retry:${options.correlationId}`
+        const retryResolution = await resolveOrCreateWorkspaceStripeCustomerId(
+            env,
+            workspaceId,
+            user,
+            stripe,
+            retryRequestScopeKey
+        )
+
+        return execute(retryResolution.customerId)
+    }
 }
 
 const fetchExistingSubscriptionByStripeId = async (env: Env, stripeSubscriptionId: string) => {
@@ -857,6 +1210,110 @@ const getInvoiceSubscriptionId = (invoice: Stripe.Invoice) => {
     return null
 }
 
+const cancelWorkspaceSubscriptionsForDeletedCustomer = async (
+    env: Env,
+    workspaceId: string,
+    stripeCustomerId: string,
+    stripeEventId: string
+) => {
+    const supabase = getServiceSupabase(env)
+    const nowIso = new Date().toISOString()
+    const cancellableStatuses = [...MANAGEABLE_SUBSCRIPTION_STATUSES]
+    const { data: rows, error: rowsError } = await supabase
+        .from('subscriptions')
+        .select('id, metadata')
+        .eq('workspace_id', workspaceId)
+        .eq('stripe_customer_id', stripeCustomerId)
+        .in('status', cancellableStatuses)
+
+    if (rowsError) {
+        throw new Error(`Failed to load subscriptions for deleted customer handling: ${rowsError.message}`)
+    }
+
+    for (const row of rows ?? []) {
+        const existingMetadata = row.metadata && typeof row.metadata === 'object' && !Array.isArray(row.metadata)
+            ? row.metadata as Record<string, unknown>
+            : {}
+
+        const { error: updateError } = await supabase
+            .from('subscriptions')
+            .update({
+                status: 'canceled',
+                canceled_at: nowIso,
+                ended_at: nowIso,
+                cancel_at_period_end: false,
+                metadata: {
+                    ...existingMetadata,
+                    source: 'stripe-webhook',
+                    reason: 'customer_deleted_event',
+                    stripe_event_id: stripeEventId,
+                    stripe_event_type: 'customer.deleted',
+                },
+            })
+            .eq('id', row.id)
+
+        if (updateError) {
+            throw new Error(`Failed to cancel subscription for deleted customer: ${updateError.message}`)
+        }
+    }
+}
+
+const handleDeletedStripeCustomer = async (
+    env: Env,
+    customerId: string,
+    stripeEventId: string
+) => {
+    const supabase = getServiceSupabase(env)
+    const workspaceIds = new Set<string>()
+
+    const { data: removedMappings, error: removeMappingError } = await supabase
+        .from('workspace_billing_customers')
+        .delete()
+        .eq('stripe_customer_id', customerId)
+        .select('workspace_id, stripe_customer_id')
+
+    if (removeMappingError) {
+        throw new Error(`Failed to remove workspace billing mapping for deleted customer: ${removeMappingError.message}`)
+    }
+
+    for (const row of (removedMappings ?? []) as WorkspaceBillingCustomerRow[]) {
+        workspaceIds.add(row.workspace_id)
+    }
+
+    const { data: subscriptionRows, error: subscriptionRowsError } = await supabase
+        .from('subscriptions')
+        .select('workspace_id')
+        .eq('stripe_customer_id', customerId)
+
+    if (subscriptionRowsError) {
+        throw new Error(`Failed to resolve workspaces for deleted Stripe customer: ${subscriptionRowsError.message}`)
+    }
+
+    for (const row of subscriptionRows ?? []) {
+        if (typeof row.workspace_id === 'string') workspaceIds.add(row.workspace_id)
+    }
+
+    for (const workspaceId of workspaceIds) {
+        await recordWorkspaceBillingCustomerEvent(env, {
+            workspaceId,
+            eventType: 'webhook_deleted',
+            oldStripeCustomerId: customerId,
+            reason: 'stripe-customer-deleted-webhook',
+            stripeEventId,
+        })
+
+        await cancelWorkspaceSubscriptionsForDeletedCustomer(
+            env,
+            workspaceId,
+            customerId,
+            stripeEventId
+        )
+
+        await ensureFreeSubscriptionForWorkspace(env, workspaceId, 'stripe-customer-deleted-webhook')
+        await refreshWorkspacePlanCache(env, workspaceId)
+    }
+}
+
 const processStripeEvent = async (env: Env, event: Stripe.Event) => {
     const stripe = getStripeClient(env)
 
@@ -874,6 +1331,15 @@ const processStripeEvent = async (env: Env, event: Stripe.Event) => {
             subscription,
             typeof session.metadata?.workspace_id === 'string' ? session.metadata.workspace_id : null
         )
+        return
+    }
+
+    if (event.type === 'customer.deleted') {
+        const customer = event.data.object as Stripe.Customer | Stripe.DeletedCustomer
+        const customerId = resolveStripeCustomerId(customer)
+        if (customerId) {
+            await handleDeletedStripeCustomer(env, customerId, event.id)
+        }
         return
     }
 
@@ -1183,15 +1649,25 @@ stripeRouter.post(
         try {
             const stripe = getStripeClient(c.env)
             const activePaid = await findEntitledPaidSubscription(c.env, workspaceId)
-            const customerId = activePaid?.stripe_customer_id
-                ?? await ensureWorkspaceStripeCustomerId(c.env, workspaceId, c.get('user'), stripe)
 
             if (activePaid) {
-                const portalSession = await stripe.billingPortal.sessions.create({
-                    customer: customerId,
-                    return_url: c.env.BILLING_PORTAL_RETURN_URL,
-                    configuration: c.env.STRIPE_BILLING_PORTAL_CONFIGURATION_ID || undefined,
-                })
+                const portalSession = await withRecoveredWorkspaceStripeCustomer(
+                    c.env,
+                    workspaceId,
+                    c.get('user'),
+                    stripe,
+                    {
+                        requestScopeKey: clientIdempotencyKey,
+                        correlationId,
+                        operation: 'checkout-session',
+                        preferredCustomerId: activePaid.stripe_customer_id ?? null,
+                    },
+                    async (customerId) => stripe.billingPortal.sessions.create({
+                        customer: customerId,
+                        return_url: c.env.BILLING_PORTAL_RETURN_URL,
+                        configuration: c.env.STRIPE_BILLING_PORTAL_CONFIGURATION_ID || undefined,
+                    })
+                )
 
                 return c.json({
                     url: portalSession.url,
@@ -1208,6 +1684,7 @@ stripeRouter.post(
                     correlation_id: correlationId,
                 }, 409)
             }
+            const stripePriceId = variant.stripe_price_id
 
             const requestFingerprint = await buildCheckoutRequestFingerprint(
                 workspaceId,
@@ -1346,31 +1823,42 @@ stripeRouter.post(
                 }
             }
 
-            const session = await stripe.checkout.sessions.create({
-                mode: 'subscription',
-                customer: customerId,
-                line_items: [{ price: variant.stripe_price_id, quantity: 1 }],
-                allow_promotion_codes: true,
-                automatic_tax: { enabled: false },
-                success_url: c.env.CHECKOUT_SUCCESS_URL,
-                cancel_url: c.env.CHECKOUT_CANCEL_URL,
-                metadata: {
-                    workspace_id: workspaceId,
-                    plan_variant_id: variant.id,
-                    requested_by_user_id: c.get('user')?.id ?? '',
+            const session = await withRecoveredWorkspaceStripeCustomer(
+                c.env,
+                workspaceId,
+                c.get('user'),
+                stripe,
+                {
+                    requestScopeKey: clientIdempotencyKey,
+                    correlationId,
+                    operation: 'checkout-session',
                 },
-                client_reference_id: workspaceId,
-                subscription_data: {
+                async (customerId) => stripe.checkout.sessions.create({
+                    mode: 'subscription',
+                    customer: customerId,
+                    line_items: [{ price: stripePriceId, quantity: 1 }],
+                    allow_promotion_codes: true,
+                    automatic_tax: { enabled: true },
+                    success_url: c.env.CHECKOUT_SUCCESS_URL,
+                    cancel_url: c.env.CHECKOUT_CANCEL_URL,
                     metadata: {
                         workspace_id: workspaceId,
                         plan_variant_id: variant.id,
                         requested_by_user_id: c.get('user')?.id ?? '',
                     },
-                    trial_period_days: variant.trial_period_days > 0 ? variant.trial_period_days : undefined,
-                },
-            }, {
-                idempotencyKey: stripeIdempotencyKey,
-            })
+                    client_reference_id: workspaceId,
+                    subscription_data: {
+                        metadata: {
+                            workspace_id: workspaceId,
+                            plan_variant_id: variant.id,
+                            requested_by_user_id: c.get('user')?.id ?? '',
+                        },
+                        trial_period_days: variant.trial_period_days > 0 ? variant.trial_period_days : undefined,
+                    },
+                }, {
+                    idempotencyKey: stripeIdempotencyKey,
+                })
+            )
 
             if (!session.url) throw new Error('Stripe did not return a checkout URL')
 
@@ -1451,12 +1939,22 @@ stripeRouter.post(
 
         try {
             const stripe = getStripeClient(c.env)
-            const customerId = await ensureWorkspaceStripeCustomerId(c.env, workspaceId, c.get('user'), stripe)
-            const session = await stripe.billingPortal.sessions.create({
-                customer: customerId,
-                return_url: c.env.BILLING_PORTAL_RETURN_URL,
-                configuration: c.env.STRIPE_BILLING_PORTAL_CONFIGURATION_ID || undefined,
-            })
+            const session = await withRecoveredWorkspaceStripeCustomer(
+                c.env,
+                workspaceId,
+                c.get('user'),
+                stripe,
+                {
+                    requestScopeKey: correlationId,
+                    correlationId,
+                    operation: 'portal-session',
+                },
+                async (customerId) => stripe.billingPortal.sessions.create({
+                    customer: customerId,
+                    return_url: c.env.BILLING_PORTAL_RETURN_URL,
+                    configuration: c.env.STRIPE_BILLING_PORTAL_CONFIGURATION_ID || undefined,
+                })
+            )
 
             return c.json({ url: session.url }, 200)
         } catch (error) {

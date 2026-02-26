@@ -1,7 +1,7 @@
 # FormSandbox Stripe Billing API v1 Test Guide
 
-Version: v2  
-Last Updated: February 25, 2026  
+Version: v3  
+Last Updated: February 26, 2026  
 Target: Cloudflare Worker deployment (`/api/v1/stripe/*`)
 
 ## 1. Scope
@@ -30,6 +30,7 @@ Before running tests:
    - `project-info-docs/migrations/2026-02-24_runner_strict_submit_rate_limit.sql`
    - `project-info-docs/migrations/2026-02-24_stripe_checkout_portal_v1.sql`
    - `project-info-docs/migrations/2026-02-25_stripe_billing_hardening_v2.sql`
+   - `project-info-docs/migrations/2026-02-26_stripe_customer_mapping_recovery_v3.sql`
 4. Worker bindings are configured:
    - `SUPABASE_URL`
    - `SUPABASE_ANON_KEY`
@@ -53,7 +54,14 @@ Before running tests:
 5. Stripe dashboard is configured:
    - products/prices for `pro` and `business` monthly/yearly
    - customer portal enabled
-   - webhook endpoint created with required events
+   - webhook endpoint created with required events:
+     - `checkout.session.completed`
+     - `customer.deleted`
+     - `customer.subscription.created`
+     - `customer.subscription.updated`
+     - `customer.subscription.deleted`
+     - `invoice.payment_failed`
+     - `invoice.paid`
 6. `plan_variants.stripe_price_id` is populated for paid active variants.
 7. You have:
    - one free workspace owned by test user
@@ -524,6 +532,71 @@ Expected:
 1. response is `413`
 2. event is not inserted into `stripe_webhook_events`
 
+### 7.25 Stale Customer Mapping Auto-Recovery (Checkout)
+Flow:
+1. Ensure a workspace has a row in `workspace_billing_customers`.
+2. Delete that Stripe customer in Dashboard test mode.
+3. Generate a new UUID for `checkout_idempotency_key`.
+4. Call:
+   - `POST {{base_url}}/api/v1/stripe/workspaces/{{workspace_id_free}}/checkout-session`
+   - payload `{ "plan_slug": "pro", "interval": "monthly" }`
+
+Expected:
+1. response is `200` with `destination = "checkout"`
+2. no `STRIPE_CHECKOUT_SESSION_FAILED` response
+3. DB mapping is recreated with a new `stripe_customer_id`
+4. `workspace_billing_customer_events` contains `invalidated` and `recreated` rows
+
+Verification SQL:
+```sql
+SELECT workspace_id, stripe_customer_id, created_at, updated_at
+FROM public.workspace_billing_customers
+WHERE workspace_id = '<workspace_id_free>';
+```
+
+```sql
+SELECT event_type, old_stripe_customer_id, new_stripe_customer_id, reason, created_at
+FROM public.workspace_billing_customer_events
+WHERE workspace_id = '<workspace_id_free>'
+ORDER BY created_at DESC
+LIMIT 20;
+```
+
+### 7.26 Stale Customer Mapping Auto-Recovery (Portal)
+Flow:
+1. Ensure workspace has a mapped `stripe_customer_id`.
+2. Delete mapped customer in Stripe Dashboard.
+3. Call:
+   - `POST {{base_url}}/api/v1/stripe/workspaces/{{workspace_id_free}}/portal-session`
+
+Expected:
+1. response is `200` with portal URL
+2. mapping is recreated to a valid customer
+3. `workspace_billing_customer_events` logs recovery sequence
+
+### 7.27 `customer.deleted` Webhook Handling
+Flow:
+1. Delete a mapped customer from Stripe Dashboard test mode.
+2. Wait for webhook delivery and processing.
+
+Expected:
+1. webhook event row reaches `completed`
+2. `workspace_billing_customers` row for that customer is deleted
+3. affected subscriptions for that customer are canceled
+4. free subscription row exists for affected workspace
+5. `workspaces.plan` resolves to `free`
+6. `workspace_billing_customer_events` includes `webhook_deleted`
+
+### 7.28 `customer.deleted` Replay Idempotency
+Flow:
+1. Open the delivered `customer.deleted` event in Stripe Dashboard.
+2. Click **Resend** to the same webhook endpoint.
+
+Expected:
+1. endpoint returns `200`
+2. no duplicate destructive state transitions
+3. workspace remains in converged free-state if no paid subscription exists
+
 ## 8. Negative Tests Checklist
 1. Missing auth header on checkout/portal -> `401`
 2. Invalid `workspaceId` UUID -> `400`
@@ -540,6 +613,7 @@ Expected:
 13. oversized webhook body -> `413`
 14. duplicate webhook replay -> `200` and no duplicate side effects
 15. `/api/v1/stripe/catalog/sync` without internal token -> `403`
+16. catalog sync does not repair missing/deleted Stripe customer mappings
 
 ## 9. Expected Response Shapes
 Checkout success (`200`):
@@ -630,6 +704,7 @@ Run in this order:
 9. Duplicate webhook idempotency (`7.14`)
 10. Crash-safe lease reclaim (`7.20`)
 11. Catalog sync and drift checks (`7.22`, `7.23`)
+12. Customer mapping recovery checks (`7.25`, `7.26`, `7.27`, `7.28`)
 
 Pass criteria:
 1. Success-path requests return expected `200`.
@@ -649,3 +724,4 @@ Pass criteria:
 7. Catalog sync and unknown-price fallback validated
 8. Production Stripe live IDs/secrets configured separately from test mode
 9. `project-info-docs/stripe-dashboard-setup.md` completed and signed off
+10. Stale customer mapping recovery validated for checkout and portal

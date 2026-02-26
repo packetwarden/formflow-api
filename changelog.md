@@ -9,6 +9,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 ## [Unreleased]
 
 ### Added
+- **Stripe Billing Recovery Hardening v3**: Added stale Stripe customer self-heal and one-time recovery retry for checkout/portal session creation in `src/routes/stripe/index.ts`.
+- **Customer Mapping Audit Trail Table**: Added `workspace_billing_customer_events` via `project-info-docs/migrations/2026-02-26_stripe_customer_mapping_recovery_v3.sql` for `validated|invalidated|recreated|webhook_deleted` tracking.
+- **`customer.deleted` Webhook Handling**: Added event handling path that removes mapping drift, cancels affected subscriptions, ensures free tier, and refreshes workspace plan cache.
+- **Stripe v3 Documentation and Test Coverage**: Updated `project-info-docs/stripe-implementation.md`, `project-info-docs/stripe-dashboard-setup.md`, `dev-docs.md`, and `test-stripe-v1.md` with stale-customer recovery runbook and validation scenarios.
 - **Stripe Billing Hardening v2**: Upgraded `src/routes/stripe/index.ts` with checkout idempotency ledger, lease-based webhook claims, stale-claim recovery, catalog sync, and hardened webhook guards.
 - **Checkout Idempotency Header Contract**: `POST /api/v1/stripe/workspaces/:workspaceId/checkout-session` now requires `Idempotency-Key` UUID with deterministic error codes (`IDEMPOTENCY_KEY_REUSED_WITH_DIFFERENT_PAYLOAD`, `IDEMPOTENCY_KEY_EXPIRED`).
 - **Stripe Catalog Sync Surface**: Added internal `POST /api/v1/stripe/catalog/sync` endpoint (token-protected) and scheduled catalog sync support (`STRIPE_CATALOG_SYNC_CRON` / default `*/15 * * * *`).
@@ -59,6 +63,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 - **Developer Documentation**: Authored `dev-docs.md` outlining the API routing strategy, architectural philosophy ("Thick Database, Thin Edge"), and edge coding standards.
 
 ### Changed
+- **Workspace Customer Resolution Policy**: Checkout and portal now validate mapped Stripe customers on every request and no longer trust stale DB mapping blindly.
+- **Customer Create Idempotency Strategy**: Customer creation idempotency key changed from workspace-static (`customer:v1`) to request-scoped (`customer:v2`) to prevent replay of deleted customer IDs.
+- **Catalog Sync Clarification**: `/api/v1/stripe/catalog/sync` is explicitly catalog-only and does not repair customer mappings.
 - **Stripe Status Policy Alignment**: Entitled status set is now `active|trialing|past_due`; `unpaid|paused|canceled` trigger immediate free-tier ensure.
 - **Invoice Event Handling**: `invoice.payment_failed` and `invoice.paid` now mutate `grace_period_end` only and no longer force subscription status in DB.
 - **Checkout Security Envelope**: Stripe internals are no longer returned to clients; checkout/portal errors now return stable app code + `correlation_id`.
