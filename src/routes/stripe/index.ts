@@ -1838,7 +1838,7 @@ stripeRouter.post(
                     customer: customerId,
                     line_items: [{ price: stripePriceId, quantity: 1 }],
                     allow_promotion_codes: true,
-                    automatic_tax: { enabled: true },
+                    automatic_tax: { enabled: false },
                     success_url: c.env.CHECKOUT_SUCCESS_URL,
                     cancel_url: c.env.CHECKOUT_CANCEL_URL,
                     metadata: {
