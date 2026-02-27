@@ -9,6 +9,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 ## [Unreleased]
 
 ### Added
+- **Stripe Status Fidelity v4 Migration**: Added `project-info-docs/migrations/2026-02-26_stripe_incomplete_status_v4.sql` to introduce `incomplete` and `incomplete_expired` enum values with metadata-driven backfill.
 - **Stripe Billing Recovery Hardening v3**: Added stale Stripe customer self-heal and one-time recovery retry for checkout/portal session creation in `src/routes/stripe/index.ts`.
 - **Customer Mapping Audit Trail Table**: Added `workspace_billing_customer_events` via `project-info-docs/migrations/2026-02-26_stripe_customer_mapping_recovery_v3.sql` for `validated|invalidated|recreated|webhook_deleted` tracking.
 - **`customer.deleted` Webhook Handling**: Added event handling path that removes mapping drift, cancels affected subscriptions, ensures free tier, and refreshes workspace plan cache.
@@ -66,7 +67,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 - **Workspace Customer Resolution Policy**: Checkout and portal now validate mapped Stripe customers on every request and no longer trust stale DB mapping blindly.
 - **Customer Create Idempotency Strategy**: Customer creation idempotency key changed from workspace-static (`customer:v1`) to request-scoped (`customer:v2`) to prevent replay of deleted customer IDs.
 - **Catalog Sync Clarification**: `/api/v1/stripe/catalog/sync` is explicitly catalog-only and does not repair customer mappings.
-- **Stripe Status Policy Alignment**: Entitled status set is now `active|trialing|past_due`; `unpaid|paused|canceled` trigger immediate free-tier ensure.
+- **Stripe Status Policy Alignment**: Entitled status set remains `active|trialing|past_due`; `incomplete` is now preserved as payment-pending/non-entitled, and `incomplete_expired|unpaid|paused|canceled` trigger free-tier ensure.
+- **Conflict-Safe Pending-to-Entitled Transition**: Stripe webhook sync now demotes conflicting entitled rows before promoting an existing Stripe-linked pending row to `active|trialing|past_due`, preventing `idx_subscriptions_one_active` violations.
 - **Invoice Event Handling**: `invoice.payment_failed` and `invoice.paid` now mutate `grace_period_end` only and no longer force subscription status in DB.
 - **Checkout Security Envelope**: Stripe internals are no longer returned to clients; checkout/portal errors now return stable app code + `correlation_id`.
 - **Webhook Processing Resilience**: Processing model moved from simple status flip to lease claim + stale claim rescue.

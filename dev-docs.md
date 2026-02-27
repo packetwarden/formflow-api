@@ -1,7 +1,7 @@
 # FormSandbox (FormFlow) Developer Documentation
 
-Version: 2.5 (Edge-Native 2026 Architecture)  
-Last Updated: February 24, 2026  
+Version: 2.6 (Edge-Native 2026 Architecture)  
+Last Updated: February 26, 2026  
 Owner: Backend Platform Team
 
 ## 1. Purpose
@@ -481,7 +481,8 @@ Webhook behavior:
    - `subscriptions` (source of truth)
    - `workspaces.plan` cache
 7. `invoice.payment_failed` / `invoice.paid` update `grace_period_end` only (no forced status overwrite)
-8. `unpaid`, `paused`, and `canceled` statuses immediately ensure free-tier subscription
+8. `unpaid`, `paused`, `canceled`, and `incomplete_expired` statuses immediately ensure free-tier subscription
+9. `incomplete` status is persisted as payment-pending and remains non-entitled (workspace plan stays free until Stripe moves to entitled status)
 
 Webhook event coverage:
 1. `checkout.session.completed`
@@ -563,6 +564,7 @@ Migration source file:
 4. `project-info-docs/migrations/2026-02-24_stripe_checkout_portal_v1.sql`
 5. `project-info-docs/migrations/2026-02-25_stripe_billing_hardening_v2.sql`
 6. `project-info-docs/migrations/2026-02-26_stripe_customer_mapping_recovery_v3.sql`
+7. `project-info-docs/migrations/2026-02-26_stripe_incomplete_status_v4.sql`
 
 ## 11. Implementation Files Added or Updated
 Updated:
@@ -586,9 +588,10 @@ Added:
 4. `project-info-docs/migrations/2026-02-24_stripe_checkout_portal_v1.sql`
 5. `project-info-docs/migrations/2026-02-25_stripe_billing_hardening_v2.sql`
 6. `project-info-docs/migrations/2026-02-26_stripe_customer_mapping_recovery_v3.sql`
-7. `project-info-docs/stripe-implementation.md`
-8. `runner-api-beta.md`
-9. `test-runner-public-v1.md`
+7. `project-info-docs/migrations/2026-02-26_stripe_incomplete_status_v4.sql`
+8. `project-info-docs/stripe-implementation.md`
+9. `runner-api-beta.md`
+10. `test-runner-public-v1.md`
 
 ## 12. Operational Runbook
 For fresh database setup:
@@ -602,7 +605,8 @@ For existing V1 environments:
 4. execute `project-info-docs/migrations/2026-02-24_stripe_checkout_portal_v1.sql`
 5. execute `project-info-docs/migrations/2026-02-25_stripe_billing_hardening_v2.sql`
 6. execute `project-info-docs/migrations/2026-02-26_stripe_customer_mapping_recovery_v3.sql`
-7. verify function privileges, webhook lease reclaim, checkout idempotency, and customer-recovery audit behavior
+7. execute `project-info-docs/migrations/2026-02-26_stripe_incomplete_status_v4.sql`
+8. verify function privileges, webhook lease reclaim, checkout idempotency, customer-recovery audit behavior, and pending-payment status handling
 
 Emergency rollback (Stripe v2 -> Stripe v1):
 1. roll back backend code to the last Stripe v1 git revision

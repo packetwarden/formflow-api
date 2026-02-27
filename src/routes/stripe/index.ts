@@ -20,8 +20,8 @@ const WEBHOOK_CLEANUP_CRON = '30 2 * * *'
 const DEFAULT_CATALOG_SYNC_CRON = '*/15 * * * *'
 
 const ENTITLED_SUBSCRIPTION_STATUSES = ['active', 'trialing', 'past_due'] as const
-const MANAGEABLE_SUBSCRIPTION_STATUSES = ['active', 'trialing', 'past_due', 'unpaid', 'paused'] as const
-const NON_ENTITLED_TERMINAL_STATUSES = ['canceled', 'unpaid', 'paused'] as const
+const MANAGEABLE_SUBSCRIPTION_STATUSES = ['active', 'trialing', 'past_due', 'unpaid', 'paused', 'incomplete', 'incomplete_expired'] as const
+const NON_ENTITLED_TERMINAL_STATUSES = ['canceled', 'unpaid', 'paused', 'incomplete_expired'] as const
 const MAX_WEBHOOK_ATTEMPTS = 8
 const DEFAULT_RETRY_BATCH_SIZE = 200
 const DEFAULT_GRACE_BATCH_SIZE = 500
@@ -35,7 +35,15 @@ const CATALOG_PLAN_SLUGS = ['pro', 'business'] as const
 const CATALOG_INTERVALS = ['monthly', 'yearly'] as const
 const CATALOG_CURRENCY = 'usd'
 
-type MappedSubscriptionStatus = 'trialing' | 'active' | 'past_due' | 'canceled' | 'unpaid' | 'paused'
+type MappedSubscriptionStatus =
+    | 'trialing'
+    | 'active'
+    | 'past_due'
+    | 'canceled'
+    | 'unpaid'
+    | 'paused'
+    | 'incomplete'
+    | 'incomplete_expired'
 type PlanVariantRow = {
     id: string
     plan_id: string
@@ -203,8 +211,9 @@ const mapStripeSubscriptionStatus = (status: Stripe.Subscription.Status): Mapped
         case 'paused':
             return 'paused'
         case 'incomplete':
-            return 'past_due'
+            return 'incomplete'
         case 'incomplete_expired':
+            return 'incomplete_expired'
         case 'canceled':
             return 'canceled'
         default:
@@ -214,6 +223,11 @@ const mapStripeSubscriptionStatus = (status: Stripe.Subscription.Status): Mapped
 
 const shouldEnsureFreeSubscription = (status: MappedSubscriptionStatus) =>
     (NON_ENTITLED_TERMINAL_STATUSES as readonly string[]).includes(status)
+
+const isEntitledSubscriptionStatus = (
+    status: string
+): status is (typeof ENTITLED_SUBSCRIPTION_STATUSES)[number] =>
+    (ENTITLED_SUBSCRIPTION_STATUSES as readonly string[]).includes(status)
 
 const isManageableSubscriptionStatus = (
     status: string
@@ -1134,12 +1148,51 @@ const upsertWorkspaceSubscriptionState = async (
     }
 
     if (existingByStripeId) {
+        if (isEntitledSubscriptionStatus(mappedStatus)) {
+            const { data: conflictingEntitledRows, error: conflictingEntitledError } = await supabase
+                .from('subscriptions')
+                .select('id, metadata')
+                .eq('workspace_id', workspaceId)
+                .in('status', [...ENTITLED_SUBSCRIPTION_STATUSES])
+                .neq('id', existingByStripeId.id)
+
+            if (conflictingEntitledError) {
+                throw new Error(`Failed to resolve conflicting entitled subscriptions: ${conflictingEntitledError.message}`)
+            }
+
+            for (const row of conflictingEntitledRows ?? []) {
+                const existingMetadata = row.metadata && typeof row.metadata === 'object' && !Array.isArray(row.metadata)
+                    ? row.metadata as Record<string, unknown>
+                    : {}
+
+                const { error: demoteError } = await supabase
+                    .from('subscriptions')
+                    .update({
+                        status: 'canceled',
+                        canceled_at: nowIso,
+                        ended_at: nowIso,
+                        cancel_at_period_end: false,
+                        metadata: {
+                            ...existingMetadata,
+                            source: 'stripe-webhook',
+                            reason: 'superseded_by_entitled_stripe_subscription',
+                            replacement_stripe_subscription_id: subscription.id,
+                        },
+                    })
+                    .eq('id', row.id)
+
+                if (demoteError) {
+                    throw new Error(`Failed to demote conflicting entitled subscription: ${demoteError.message}`)
+                }
+            }
+        }
+
         const { error } = await supabase.from('subscriptions').update(payload).eq('id', existingByStripeId.id)
         if (error) throw new Error(`Failed to update subscription by Stripe ID: ${error.message}`)
         return mappedStatus
     }
 
-    if ((ENTITLED_SUBSCRIPTION_STATUSES as readonly string[]).includes(mappedStatus)) {
+    if (isEntitledSubscriptionStatus(mappedStatus)) {
         const { data: entitledRows, error: entitledError } = await supabase
             .from('subscriptions')
             .select('id')
@@ -1838,7 +1891,7 @@ stripeRouter.post(
                     customer: customerId,
                     line_items: [{ price: stripePriceId, quantity: 1 }],
                     allow_promotion_codes: true,
-                    automatic_tax: { enabled: false },
+                    automatic_tax: { enabled: true },
                     success_url: c.env.CHECKOUT_SUCCESS_URL,
                     cancel_url: c.env.CHECKOUT_CANCEL_URL,
                     metadata: {

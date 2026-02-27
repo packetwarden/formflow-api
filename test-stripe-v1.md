@@ -1,6 +1,6 @@
 # FormSandbox Stripe Billing API v1 Test Guide
 
-Version: v3  
+Version: v4  
 Last Updated: February 26, 2026  
 Target: Cloudflare Worker deployment (`/api/v1/stripe/*`)
 
@@ -31,6 +31,7 @@ Before running tests:
    - `project-info-docs/migrations/2026-02-24_stripe_checkout_portal_v1.sql`
    - `project-info-docs/migrations/2026-02-25_stripe_billing_hardening_v2.sql`
    - `project-info-docs/migrations/2026-02-26_stripe_customer_mapping_recovery_v3.sql`
+   - `project-info-docs/migrations/2026-02-26_stripe_incomplete_status_v4.sql`
 4. Worker bindings are configured:
    - `SUPABASE_URL`
    - `SUPABASE_ANON_KEY`
@@ -597,6 +598,46 @@ Expected:
 2. no duplicate destructive state transitions
 3. workspace remains in converged free-state if no paid subscription exists
 
+### 7.29 `customer.subscription.created` with `incomplete` (Payment Pending)
+Flow:
+1. Create a subscription flow in Stripe test mode that emits `customer.subscription.created` with status `incomplete`.
+2. Deliver webhook to the worker endpoint.
+
+Expected:
+1. webhook event reaches `completed`
+2. `subscriptions.status` is stored as `incomplete` (not remapped to `past_due`)
+3. `workspaces.plan` remains `free` until Stripe transitions to an entitled status
+
+Verification SQL:
+```sql
+SELECT s.workspace_id, s.status, s.metadata ->> 'stripe_status' AS stripe_status, pl.slug AS plan_slug
+FROM public.subscriptions s
+JOIN public.plans pl ON pl.id = s.plan_id
+WHERE s.workspace_id = '<workspace_id_under_test>'
+ORDER BY s.created_at DESC
+LIMIT 5;
+```
+
+### 7.30 `customer.subscription.updated` with `incomplete_expired` (Terminal Pending)
+Flow:
+1. Transition an existing pending subscription to `incomplete_expired` in Stripe test mode.
+2. Deliver webhook to the worker endpoint.
+
+Expected:
+1. webhook event reaches `completed`
+2. `subscriptions.status` is stored as `incomplete_expired`
+3. free subscription row is ensured and `workspaces.plan = 'free'`
+
+Verification SQL:
+```sql
+SELECT s.workspace_id, s.status, s.canceled_at, s.ended_at, pl.slug AS plan_slug
+FROM public.subscriptions s
+JOIN public.plans pl ON pl.id = s.plan_id
+WHERE s.workspace_id = '<workspace_id_under_test>'
+ORDER BY s.created_at DESC
+LIMIT 10;
+```
+
 ## 8. Negative Tests Checklist
 1. Missing auth header on checkout/portal -> `401`
 2. Invalid `workspaceId` UUID -> `400`
@@ -701,10 +742,11 @@ Run in this order:
 6. Re-call checkout for paid workspace (`7.5`)
 7. Portal session success (`7.6`)
 8. Payment failed/recovery (`7.11`, `7.12`)
-9. Duplicate webhook idempotency (`7.14`)
-10. Crash-safe lease reclaim (`7.20`)
-11. Catalog sync and drift checks (`7.22`, `7.23`)
-12. Customer mapping recovery checks (`7.25`, `7.26`, `7.27`, `7.28`)
+9. Pending status lifecycle checks (`7.29`, `7.30`)
+10. Duplicate webhook idempotency (`7.14`)
+11. Crash-safe lease reclaim (`7.20`)
+12. Catalog sync and drift checks (`7.22`, `7.23`)
+13. Customer mapping recovery checks (`7.25`, `7.26`, `7.27`, `7.28`)
 
 Pass criteria:
 1. Success-path requests return expected `200`.
@@ -712,7 +754,8 @@ Pass criteria:
 3. Webhook rows converge to `completed` after retries.
 4. `workspaces.plan` always matches active paid subscription or `free`.
 5. Free-subscription race checks never produce duplicate non-Stripe entitled rows.
-6. No unexpected `5xx` responses.
+6. Pending subscription statuses (`incomplete`, `incomplete_expired`) are persisted without lossy remapping.
+7. No unexpected `5xx` responses.
 
 ## 11. Release Checklist
 1. `cmd /c npx tsc --noEmit` passes
