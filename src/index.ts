@@ -6,7 +6,7 @@ import type { Env } from './types'
 import authRouter from './routes/auth'
 import buildRouter from './routes/build'
 import runnerRouter from './routes/f'
-import stripeRouter from './routes/stripe'
+import stripeRouter, { runStripeScheduled } from './routes/stripe'
 
 const app = new Hono<{ Bindings: Env }>()
 
@@ -27,4 +27,13 @@ app.get('/', (c) => {
     return c.text('FormSandbox (FormFlow) API Edge Runtime')
 })
 
-export default app
+const handler: ExportedHandler<Env> = {
+    fetch(request, env, executionCtx) {
+        return app.fetch(request, env, executionCtx)
+    },
+    async scheduled(controller, env, executionCtx) {
+        executionCtx.waitUntil(runStripeScheduled(env, controller.cron))
+    },
+}
+
+export default handler

@@ -4,6 +4,7 @@ import { Env, Variables } from '../../types'
 import { getSupabaseClient } from '../../db/supabase'
 import { signUpSchema, loginSchema } from '../../utils/validation'
 import { requireAuth } from '../../middlewares/auth'
+import { authPublicWriteRateLimit, authUserWriteRateLimit } from '../../middlewares/rate-limit'
 
 const authRouter = new Hono<{ Bindings: Env; Variables: Variables }>()
 
@@ -11,7 +12,7 @@ const authRouter = new Hono<{ Bindings: Env; Variables: Variables }>()
  * POST /api/v1/auth/signup
  * Registers a new user via Supabase Auth.
  */
-authRouter.post('/signup', zValidator('json', signUpSchema), async (c) => {
+authRouter.post('/signup', authPublicWriteRateLimit, zValidator('json', signUpSchema), async (c) => {
     const { email, password, full_name } = c.req.valid('json')
     const supabase = getSupabaseClient(c.env.SUPABASE_URL, c.env.SUPABASE_ANON_KEY)
 
@@ -36,7 +37,7 @@ authRouter.post('/signup', zValidator('json', signUpSchema), async (c) => {
  * POST /api/v1/auth/login
  * Authenticates a user and returns their session (access token + refresh token).
  */
-authRouter.post('/login', zValidator('json', loginSchema), async (c) => {
+authRouter.post('/login', authPublicWriteRateLimit, zValidator('json', loginSchema), async (c) => {
     const { email, password } = c.req.valid('json')
     const supabase = getSupabaseClient(c.env.SUPABASE_URL, c.env.SUPABASE_ANON_KEY)
 
@@ -57,30 +58,27 @@ authRouter.post('/login', zValidator('json', loginSchema), async (c) => {
  * Logs out the user and invalidates the session globally.
  * Requires Authentication.
  */
-authRouter.post('/logout', requireAuth, async (c) => {
-    // Extract token to sign out explicitly if needed, but the edge client handles scope
-    // If we wanted to ensure the token from headers is invalidated we'd need admin client
-    // But standard signout works within the context if we pass the token, however edge
-    // instances without persistence won't inherently "know" the session without passing the jwt
-
-    const authHeader = c.req.header('Authorization')
-    const token = authHeader?.split(' ')[1] // safe, requireAuth ran
-
-    if (!token) return c.json({ error: 'Token missing' }, 400)
+authRouter.post('/logout', requireAuth, authUserWriteRateLimit, async (c) => {
+    // requireAuth already verified the JWT and stores it in request context.
+    const token = c.get('accessToken')
+    if (!token) return c.json({ error: 'Unauthorized: Missing token context' }, 401)
 
     const supabase = getSupabaseClient(c.env.SUPABASE_URL, c.env.SUPABASE_ANON_KEY)
 
-    // Explicitly sign out with the provided token context via `global` headers
+    // Revoke all refresh-token sessions for this user JWT.
     const { error } = await supabase.auth.admin.signOut(token, 'global')
+    if (error) {
+        const status = (error as { status?: number }).status
+        // Treat missing/invalid/already-terminated session as idempotent success.
+        if (status === 401 || status === 403 || status === 404) {
+            return c.json({ message: 'Logged out. Please remove tokens from client storage.' }, 200)
+        }
 
-    // NOTE: .admin.signOut requires the service_role key.
-    // We will correct this to use standard edge-centric logout if needed,
-    // but true standard `supabase.auth.signOut()` requires a local session state.
-    // Without persistence, simply ignoring the token client-side is often enough, 
-    // but to truly kill it, we use the admin API or rely on short TTLs.
+        console.error('Logout Route Error:', error.message)
+        return c.json({ error: 'Failed to log out' }, 500)
+    }
 
-    // Let's implement the standard edge SignOut workaround:
-    return c.json({ message: 'Logged out. Please remove token from client storage.' }, 200)
+    return c.json({ message: 'Logged out. Please remove tokens from client storage.' }, 200)
 })
 
 /**
