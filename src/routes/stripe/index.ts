@@ -34,6 +34,25 @@ const FREE_PLAN_SLUG = 'free'
 const CATALOG_PLAN_SLUGS = ['pro', 'business'] as const
 const CATALOG_INTERVALS = ['monthly', 'yearly'] as const
 const CATALOG_CURRENCY = 'usd'
+const SUBSCRIPTION_SYNC_EVENT_TYPES = new Set<string>([
+    'customer.subscription.created',
+    'customer.subscription.updated',
+    'customer.subscription.deleted',
+    'customer.subscription.paused',
+    'customer.subscription.resumed',
+] as const)
+const SUBSCRIPTION_TRIAL_WILL_END_EVENT = 'customer.subscription.trial_will_end'
+const INVOICE_CREATED_EVENT = 'invoice.created'
+const INVOICE_GRACE_SET_EVENT_TYPES = new Set<string>([
+    'invoice.payment_failed',
+    'invoice.payment_action_required',
+    // Forward-compatible alias introduced in Stripe changelog.
+    'invoice.payment_attempt_required',
+] as const)
+const INVOICE_GRACE_CLEAR_EVENT_TYPES = new Set<string>([
+    'invoice.paid',
+] as const)
+const INVOICE_FINALIZATION_FAILED_EVENT = 'invoice.finalization_failed'
 
 type MappedSubscriptionStatus =
     | 'trialing'
@@ -494,7 +513,7 @@ const syncStripeCatalog = async (
     const bestByVariantKey = new Map<string, CatalogCandidate>()
 
     let startingAfter: string | undefined
-    for (;;) {
+    for (; ;) {
         const page = await stripe.prices.list({
             active: true,
             type: 'recurring',
@@ -1263,6 +1282,78 @@ const getInvoiceSubscriptionId = (invoice: Stripe.Invoice) => {
     return null
 }
 
+const syncSubscriptionFromInvoice = async (
+    env: Env,
+    stripe: Stripe,
+    invoice: Stripe.Invoice
+) => {
+    const subscriptionId = getInvoiceSubscriptionId(invoice)
+    if (!subscriptionId) return null
+
+    const subscription = await stripe.subscriptions.retrieve(subscriptionId)
+    const workspaceId = await syncSubscriptionFromStripe(env, subscription)
+    return {
+        subscriptionId,
+        workspaceId,
+        subscription,
+    }
+}
+
+const enforceUnpaidStatusAndFreeTier = async (
+    env: Env,
+    stripeSubscriptionId: string,
+    stripeEventId: string,
+    stripeEventType: string
+) => {
+    const supabase = getServiceSupabase(env)
+    const { data: row, error: rowError } = await supabase
+        .from('subscriptions')
+        .select('id, workspace_id, metadata')
+        .eq('stripe_subscription_id', stripeSubscriptionId)
+        .maybeSingle()
+
+    if (rowError && rowError.code !== 'PGRST116') {
+        throw new Error(`Failed to resolve subscription for finalization failure handling: ${rowError.message}`)
+    }
+
+    if (!row?.id || !row.workspace_id) {
+        logStripe('warn', 'No local subscription row found for invoice finalization_failed enforcement', {
+            stripe_subscription_id: stripeSubscriptionId,
+            stripe_event_id: stripeEventId,
+            stripe_event_type: stripeEventType,
+        })
+        return null
+    }
+
+    const existingMetadata = row.metadata && typeof row.metadata === 'object' && !Array.isArray(row.metadata)
+        ? row.metadata as Record<string, unknown>
+        : {}
+
+    const { error: updateError } = await supabase
+        .from('subscriptions')
+        .update({
+            status: 'unpaid',
+            grace_period_end: null,
+            cancel_at_period_end: false,
+            metadata: {
+                ...existingMetadata,
+                source: 'stripe-webhook',
+                reason: 'invoice_finalization_failed',
+                stripe_event_id: stripeEventId,
+                stripe_event_type: stripeEventType,
+            },
+        })
+        .eq('id', row.id)
+
+    if (updateError) {
+        throw new Error(`Failed to enforce unpaid status after invoice finalization failure: ${updateError.message}`)
+    }
+
+    await ensureFreeSubscriptionForWorkspace(env, row.workspace_id, 'invoice-finalization-failed')
+    await refreshWorkspacePlanCache(env, row.workspace_id)
+    return row.workspace_id
+}
+
 const cancelWorkspaceSubscriptionsForDeletedCustomer = async (
     env: Env,
     workspaceId: string,
@@ -1369,8 +1460,9 @@ const handleDeletedStripeCustomer = async (
 
 const processStripeEvent = async (env: Env, event: Stripe.Event) => {
     const stripe = getStripeClient(env)
+    const eventType = event.type as string
 
-    if (event.type === 'checkout.session.completed') {
+    if (eventType === 'checkout.session.completed') {
         const session = event.data.object as Stripe.Checkout.Session
         if (session.mode !== 'subscription') return
 
@@ -1387,7 +1479,7 @@ const processStripeEvent = async (env: Env, event: Stripe.Event) => {
         return
     }
 
-    if (event.type === 'customer.deleted') {
+    if (eventType === 'customer.deleted') {
         const customer = event.data.object as Stripe.Customer | Stripe.DeletedCustomer
         const customerId = resolveStripeCustomerId(customer)
         if (customerId) {
@@ -1396,30 +1488,70 @@ const processStripeEvent = async (env: Env, event: Stripe.Event) => {
         return
     }
 
-    if (
-        event.type === 'customer.subscription.created'
-        || event.type === 'customer.subscription.updated'
-        || event.type === 'customer.subscription.deleted'
-    ) {
+    if (SUBSCRIPTION_SYNC_EVENT_TYPES.has(eventType)) {
         await syncSubscriptionFromStripe(env, event.data.object as Stripe.Subscription)
         return
     }
 
-    if (event.type === 'invoice.payment_failed' || event.type === 'invoice.paid') {
+    if (eventType === SUBSCRIPTION_TRIAL_WILL_END_EVENT) {
+        const subscription = event.data.object as Stripe.Subscription
+        const workspaceId = await syncSubscriptionFromStripe(env, subscription)
+        logStripe('info', 'Stripe trial_will_end processed', {
+            event_id: event.id,
+            event_type: eventType,
+            subscription_id: subscription.id,
+            workspace_id: workspaceId,
+            trial_end: toIsoFromUnix(subscription.trial_end),
+        })
+        return
+    }
+
+    if (
+        INVOICE_GRACE_SET_EVENT_TYPES.has(eventType)
+        || INVOICE_GRACE_CLEAR_EVENT_TYPES.has(eventType)
+        || eventType === INVOICE_FINALIZATION_FAILED_EVENT
+    ) {
         const invoice = event.data.object as Stripe.Invoice
-        const subscriptionId = getInvoiceSubscriptionId(invoice)
-        if (!subscriptionId) return
+        const synced = await syncSubscriptionFromInvoice(env, stripe, invoice)
+        if (!synced) return
 
-        const subscription = await stripe.subscriptions.retrieve(subscriptionId)
-        await syncSubscriptionFromStripe(env, subscription)
-
-        if (event.type === 'invoice.payment_failed') {
+        if (INVOICE_GRACE_SET_EVENT_TYPES.has(eventType)) {
             const graceDays = parseGraceDays(env)
             const graceEnd = new Date(Date.now() + graceDays * 24 * 60 * 60 * 1000).toISOString()
-            await setGracePeriodForSubscription(env, subscriptionId, graceEnd)
-        } else {
-            await setGracePeriodForSubscription(env, subscriptionId, null)
+            await setGracePeriodForSubscription(env, synced.subscriptionId, graceEnd)
+
+            if (eventType === 'invoice.payment_action_required' || eventType === 'invoice.payment_attempt_required') {
+                logStripe('warn', 'Stripe invoice requires customer payment action', {
+                    event_id: event.id,
+                    event_type: eventType,
+                    invoice_id: invoice.id,
+                    stripe_subscription_id: synced.subscriptionId,
+                    workspace_id: synced.workspaceId,
+                    grace_period_end: graceEnd,
+                })
+            }
+            return
         }
+
+        if (INVOICE_GRACE_CLEAR_EVENT_TYPES.has(eventType)) {
+            await setGracePeriodForSubscription(env, synced.subscriptionId, null)
+            return
+        }
+
+        const enforcedWorkspaceId = await enforceUnpaidStatusAndFreeTier(
+            env,
+            synced.subscriptionId,
+            event.id,
+            eventType
+        )
+        logStripe('warn', 'Stripe invoice finalization failed; enforced unpaid status and free-tier access', {
+            event_id: event.id,
+            event_type: eventType,
+            invoice_id: invoice.id,
+            stripe_subscription_id: synced.subscriptionId,
+            synced_workspace_id: synced.workspaceId,
+            enforced_workspace_id: enforcedWorkspaceId,
+        })
     }
 }
 
@@ -2090,12 +2222,21 @@ stripeRouter.post('/webhook', async (c) => {
         return c.json({ error: 'Invalid Stripe signature' }, 400)
     }
 
+    const eventType = event.type as string
+    if (eventType === INVOICE_CREATED_EVENT) {
+        logStripe('info', 'Stripe webhook invoice.created acknowledged immediately', {
+            event_id: event.id,
+            event_type: eventType,
+        })
+        return c.json({ received: true, ack_only: true }, 200)
+    }
+
     const supabase = getServiceSupabase(c.env)
     const { error: insertError } = await supabase
         .from('stripe_webhook_events')
         .insert({
             event_id: event.id,
-            event_type: event.type,
+            event_type: eventType,
             payload: event,
             status: 'pending',
             attempts: 0,
@@ -2109,7 +2250,7 @@ stripeRouter.post('/webhook', async (c) => {
     if (insertError) {
         logStripe('error', 'Stripe webhook insert failed', {
             event_id: event.id,
-            event_type: event.type,
+            event_type: eventType,
             error: insertError.message,
         })
         return c.json({ error: 'Failed to persist webhook event' }, 500)
@@ -2120,4 +2261,3 @@ stripeRouter.post('/webhook', async (c) => {
 })
 
 export default stripeRouter
-

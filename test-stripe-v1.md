@@ -61,7 +61,13 @@ Before running tests:
      - `customer.subscription.created`
      - `customer.subscription.updated`
      - `customer.subscription.deleted`
+     - `customer.subscription.paused`
+     - `customer.subscription.resumed`
+     - `customer.subscription.trial_will_end`
+     - `invoice.created`
      - `invoice.payment_failed`
+     - `invoice.payment_action_required`
+     - `invoice.finalization_failed`
      - `invoice.paid`
 6. `plan_variants.stripe_price_id` is populated for paid active variants.
 7. You have:
@@ -638,6 +644,143 @@ ORDER BY s.created_at DESC
 LIMIT 10;
 ```
 
+### 7.31 `invoice.created` Fast ACK (`200`)
+Flow:
+1. Trigger invoice-created delivery from Stripe (CLI, dashboard resend, or an invoice-creating flow).
+2. Ensure the event reaches the webhook endpoint with valid signature.
+
+Expected:
+1. endpoint returns `200` immediately
+2. response body includes `ack_only = true`
+3. event is intentionally not persisted in `stripe_webhook_events`
+
+Verification SQL:
+```sql
+SELECT event_id, event_type, status, created_at
+FROM public.stripe_webhook_events
+WHERE event_type = 'invoice.created'
+ORDER BY created_at DESC
+LIMIT 5;
+```
+
+### 7.32 `invoice.payment_action_required` Sets Grace Window
+Flow:
+1. Trigger or resend an `invoice.payment_action_required` event for a known subscription.
+2. Wait for async webhook processing completion.
+
+Expected:
+1. webhook row reaches `completed`
+2. `subscriptions.grace_period_end` is set
+3. subscription/workspace linkage remains consistent (no hard downgrade from this event alone)
+
+Verification SQL:
+```sql
+SELECT s.workspace_id, s.status, s.grace_period_end, pl.slug AS plan_slug
+FROM public.subscriptions s
+JOIN public.plans pl ON pl.id = s.plan_id
+WHERE s.workspace_id = '<workspace_id_under_test>'
+ORDER BY s.created_at DESC
+LIMIT 10;
+```
+
+### 7.33 `customer.subscription.paused` Enforces Non-Entitled Access
+Flow:
+1. Pause a subscription in Stripe test mode.
+2. Deliver `customer.subscription.paused` to the worker.
+
+Expected:
+1. webhook row reaches `completed`
+2. latest Stripe-linked subscription row stores `status = 'paused'`
+3. free subscription row exists
+4. `workspaces.plan = 'free'`
+
+Verification SQL:
+```sql
+SELECT s.workspace_id, s.status, s.stripe_subscription_id, pl.slug AS plan_slug, s.created_at
+FROM public.subscriptions s
+JOIN public.plans pl ON pl.id = s.plan_id
+WHERE s.workspace_id = '<workspace_id_under_test>'
+ORDER BY s.created_at DESC
+LIMIT 15;
+```
+
+```sql
+SELECT id, plan
+FROM public.workspaces
+WHERE id = '<workspace_id_under_test>';
+```
+
+### 7.34 `customer.subscription.resumed` Restores Entitlement
+Flow:
+1. Resume a previously paused Stripe subscription.
+2. Deliver `customer.subscription.resumed` to the worker.
+
+Expected:
+1. webhook row reaches `completed`
+2. Stripe-linked subscription status updates from paused to an entitled state from Stripe
+3. `workspaces.plan` reflects the paid plan slug again
+
+Verification SQL:
+```sql
+SELECT s.workspace_id, s.status, pl.slug AS plan_slug, s.created_at
+FROM public.subscriptions s
+JOIN public.plans pl ON pl.id = s.plan_id
+WHERE s.workspace_id = '<workspace_id_under_test>'
+ORDER BY s.created_at DESC
+LIMIT 10;
+```
+
+```sql
+SELECT id, plan
+FROM public.workspaces
+WHERE id = '<workspace_id_under_test>';
+```
+
+### 7.35 `customer.subscription.trial_will_end` Sync + Logging
+Flow:
+1. Trigger or resend `customer.subscription.trial_will_end`.
+2. Wait for async processing.
+
+Expected:
+1. webhook row reaches `completed`
+2. subscription state remains synchronized
+3. structured log entry exists with `event_id`, `subscription_id`, `workspace_id`, and `trial_end`
+
+### 7.36 `invoice.finalization_failed` Immediate Free-Tier Enforcement
+Flow:
+1. Trigger or resend `invoice.finalization_failed` for a paid subscription.
+2. Wait for async processing.
+
+Expected:
+1. webhook row reaches `completed`
+2. Stripe-linked row is forced to `status = 'unpaid'`
+3. free subscription row is ensured
+4. `workspaces.plan = 'free'`
+5. subscription metadata contains finalization-failure reason and Stripe event linkage
+
+Verification SQL:
+```sql
+SELECT s.workspace_id,
+       s.status,
+       s.grace_period_end,
+       s.metadata ->> 'reason' AS reason,
+       s.metadata ->> 'stripe_event_id' AS stripe_event_id,
+       s.metadata ->> 'stripe_event_type' AS stripe_event_type,
+       pl.slug AS plan_slug,
+       s.created_at
+FROM public.subscriptions s
+JOIN public.plans pl ON pl.id = s.plan_id
+WHERE s.workspace_id = '<workspace_id_under_test>'
+ORDER BY s.created_at DESC
+LIMIT 15;
+```
+
+```sql
+SELECT id, plan
+FROM public.workspaces
+WHERE id = '<workspace_id_under_test>';
+```
+
 ## 8. Negative Tests Checklist
 1. Missing auth header on checkout/portal -> `401`
 2. Invalid `workspaceId` UUID -> `400`
@@ -655,6 +798,7 @@ LIMIT 10;
 14. duplicate webhook replay -> `200` and no duplicate side effects
 15. `/api/v1/stripe/catalog/sync` without internal token -> `403`
 16. catalog sync does not repair missing/deleted Stripe customer mappings
+17. `invoice.created` (valid signature) -> `200` with `ack_only = true` and no durable queue insert
 
 ## 9. Expected Response Shapes
 Checkout success (`200`):
@@ -742,11 +886,16 @@ Run in this order:
 6. Re-call checkout for paid workspace (`7.5`)
 7. Portal session success (`7.6`)
 8. Payment failed/recovery (`7.11`, `7.12`)
-9. Pending status lifecycle checks (`7.29`, `7.30`)
-10. Duplicate webhook idempotency (`7.14`)
-11. Crash-safe lease reclaim (`7.20`)
-12. Catalog sync and drift checks (`7.22`, `7.23`)
-13. Customer mapping recovery checks (`7.25`, `7.26`, `7.27`, `7.28`)
+9. Payment-action-required grace behavior (`7.32`)
+10. Pending status lifecycle checks (`7.29`, `7.30`)
+11. Pause/resume entitlement lifecycle (`7.33`, `7.34`)
+12. Trial warning operational handling (`7.35`)
+13. Finalization-failed immediate free-tier enforcement (`7.36`)
+14. `invoice.created` fast-ack behavior (`7.31`)
+15. Duplicate webhook idempotency (`7.14`)
+16. Crash-safe lease reclaim (`7.20`)
+17. Catalog sync and drift checks (`7.22`, `7.23`)
+18. Customer mapping recovery checks (`7.25`, `7.26`, `7.27`, `7.28`)
 
 Pass criteria:
 1. Success-path requests return expected `200`.
@@ -755,7 +904,9 @@ Pass criteria:
 4. `workspaces.plan` always matches active paid subscription or `free`.
 5. Free-subscription race checks never produce duplicate non-Stripe entitled rows.
 6. Pending subscription statuses (`incomplete`, `incomplete_expired`) are persisted without lossy remapping.
-7. No unexpected `5xx` responses.
+7. `invoice.created` returns immediate `200` via ack-only path.
+8. `invoice.finalization_failed` forces Stripe-linked row to `unpaid` and converges workspace plan to `free`.
+9. No unexpected `5xx` responses.
 
 ## 11. Release Checklist
 1. `cmd /c npx tsc --noEmit` passes

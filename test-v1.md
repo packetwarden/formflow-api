@@ -36,6 +36,7 @@ Before running tests:
    - `project-info-docs/migrations/2026-02-23_runner_public_api_v1.sql`
    - `project-info-docs/migrations/2026-02-24_runner_strict_submit_rate_limit.sql`
    - `project-info-docs/migrations/2026-02-27_runner_submission_gateway_hardening_v1.sql`
+   - `project-info-docs/migrations/2026-02-27_security_definer_hardening_v2.sql`
    - `project-info-docs/migrations/2026-02-24_stripe_checkout_portal_v1.sql`
    - `project-info-docs/migrations/2026-02-25_stripe_billing_hardening_v2.sql`
 4. Have at least one test user email/password ready (owner/editor).
@@ -370,6 +371,46 @@ Expected:
 8. Editor token `DELETE /build/:workspaceId/forms/:formId` -> `403`
 9. Publish with inaccessible workspace/form -> `404` or `403`
 10. Create when `max_forms` limit reached -> `403` with `code = PLAN_LIMIT_EXCEEDED`
+11. Direct Supabase RPC `check_request()` with authenticated key -> blocked (`401/403`)
+12. Direct Supabase RPC `get_workspace_entitlements(UUID)` with anon key -> blocked (`401/403`)
+13. Authenticated `publish_form(...)` RPC with mismatched `p_published_by` -> blocked (`403`, SQLSTATE `42501`)
+14. Direct Supabase RPC `submit_form(...)` with anon/authenticated key -> blocked (`401/403`)
+
+### 8.1 Security SQL Audit Snippets
+Search-path hardening audit (expect zero rows):
+```sql
+SELECT
+  n.nspname AS schema_name,
+  p.proname AS function_name,
+  pg_get_function_identity_arguments(p.oid) AS args,
+  p.proconfig
+FROM pg_proc p
+JOIN pg_namespace n ON n.oid = p.pronamespace
+WHERE p.prosecdef = true
+  AND (
+    p.proconfig IS NULL
+    OR NOT EXISTS (
+      SELECT 1
+      FROM unnest(p.proconfig) AS cfg
+      WHERE cfg LIKE 'search_path=%'
+    )
+  )
+ORDER BY n.nspname, p.proname;
+```
+
+Function execute exposure audit for public SECURITY DEFINER functions (expect only explicitly approved rows):
+```sql
+SELECT
+  n.nspname AS schema_name,
+  p.proname AS function_name,
+  pg_get_function_identity_arguments(p.oid) AS args
+FROM pg_proc p
+JOIN pg_namespace n ON n.oid = p.pronamespace
+WHERE n.nspname = 'public'
+  AND p.prosecdef = true
+  AND has_function_privilege('public', p.oid, 'EXECUTE')
+ORDER BY p.proname;
+```
 
 Optional entitlement-disable simulation:
 ```sql

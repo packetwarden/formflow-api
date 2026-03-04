@@ -28,6 +28,7 @@ Before running tests:
    - `project-info-docs/migrations/2026-02-23_runner_public_api_v1.sql`
    - `project-info-docs/migrations/2026-02-24_runner_strict_submit_rate_limit.sql`
    - `project-info-docs/migrations/2026-02-27_runner_submission_gateway_hardening_v1.sql`
+   - `project-info-docs/migrations/2026-02-27_security_definer_hardening_v2.sql`
 4. Prepare published test forms (see Section 4).
 5. Confirm `check_request()` strict gate is active for submit-path rate-limit tests.
 
@@ -420,6 +421,30 @@ Use `form_id_valid` and mutate one field per request.
 13. Burst submissions -> `429`
 14. Direct Supabase Data API `INSERT` to `public.form_submissions` with anon key -> blocked (`401/403`)
 15. Direct Supabase RPC `submit_form` call with anon key -> blocked (`401/403`)
+16. Direct Supabase RPC `get_workspace_entitlements(UUID)` with anon key -> blocked (`401/403`)
+17. Direct Supabase RPC `check_request()` with authenticated key -> blocked (`401/403`)
+
+### 9.1 Security SQL Audit Snippets
+Search-path hardening audit (expect zero rows):
+```sql
+SELECT
+  n.nspname AS schema_name,
+  p.proname AS function_name,
+  pg_get_function_identity_arguments(p.oid) AS args,
+  p.proconfig
+FROM pg_proc p
+JOIN pg_namespace n ON n.oid = p.pronamespace
+WHERE p.prosecdef = true
+  AND (
+    p.proconfig IS NULL
+    OR NOT EXISTS (
+      SELECT 1
+      FROM unnest(p.proconfig) AS cfg
+      WHERE cfg LIKE 'search_path=%'
+    )
+  )
+ORDER BY n.nspname, p.proname;
+```
 
 ## 10. Expected Response Shapes
 Success schema (`200`):

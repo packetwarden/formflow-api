@@ -1,7 +1,7 @@
 # FormSandbox (FormFlow) Developer Documentation
 
 Version: 2.6 (Edge-Native 2026 Architecture)  
-Last Updated: February 26, 2026  
+Last Updated: February 28, 2026  
 Owner: Backend Platform Team
 
 ## 1. Purpose
@@ -473,17 +473,21 @@ Catalog sync behavior:
 Webhook behavior:
 1. verifies `stripe-signature` using Stripe SDK `constructEventAsync`
 2. enforces payload size guard before parse (`STRIPE_WEBHOOK_MAX_BODY_BYTES`)
-3. inserts `event_id` idempotently into `stripe_webhook_events`
-4. duplicate event inserts return `200` without reprocessing
-5. accepted events are processed asynchronously via lease-based claim processing:
+3. `invoice.created` is acknowledged immediately with `200` after signature verification (fast-ack path; no durable queue insert)
+4. non-ack-only events insert `event_id` idempotently into `stripe_webhook_events`
+5. duplicate non-ack-only event inserts return `200` without reprocessing
+6. accepted non-ack-only events are processed asynchronously via lease-based claim processing:
    - claim due `pending|failed`
    - reclaim stale `processing` by expired `claim_expires_at` (and legacy `NULL` claim rows)
-6. subscription state sync updates:
+7. subscription state sync updates:
    - `subscriptions` (source of truth)
    - `workspaces.plan` cache
-7. `invoice.payment_failed` / `invoice.paid` update `grace_period_end` only (no forced status overwrite)
-8. `unpaid`, `paused`, `canceled`, and `incomplete_expired` statuses immediately ensure free-tier subscription
-9. `incomplete` status is persisted as payment-pending and remains non-entitled (workspace plan stays free until Stripe moves to entitled status)
+8. `invoice.payment_failed`, `invoice.payment_action_required`, and `invoice.payment_attempt_required` set `grace_period_end` (no invoice-driven status overwrite)
+9. `invoice.paid` clears `grace_period_end`
+10. `invoice.finalization_failed` syncs from Stripe, then enforces local `status = unpaid`, ensures free-tier subscription, and refreshes workspace plan cache
+11. `unpaid`, `paused`, `canceled`, and `incomplete_expired` statuses immediately ensure free-tier subscription
+12. `incomplete` status is persisted as payment-pending and remains non-entitled (workspace plan stays free until Stripe moves to entitled status)
+13. `customer.subscription.trial_will_end` is processed with subscription sync and structured operational logging (no outbound notifier in current release)
 
 Webhook event coverage:
 1. `checkout.session.completed`
@@ -491,8 +495,15 @@ Webhook event coverage:
 3. `customer.subscription.created`
 4. `customer.subscription.updated`
 5. `customer.subscription.deleted`
-6. `invoice.payment_failed`
-7. `invoice.paid`
+6. `customer.subscription.paused`
+7. `customer.subscription.resumed`
+8. `customer.subscription.trial_will_end`
+9. `invoice.created` (ack-only)
+10. `invoice.payment_failed`
+11. `invoice.payment_action_required`
+12. `invoice.payment_attempt_required` (forward-compatible alias handling)
+13. `invoice.finalization_failed`
+14. `invoice.paid`
 
 Scheduled jobs (Worker `scheduled` handler):
 1. webhook replay pass (`*/5 * * * *`):
@@ -540,11 +551,16 @@ Schema file: `project-info-docs/formflow_beta_schema_v2.sql`
    - old: `SELECT schema, settings FROM public.forms` (invalid in beta schema)
    - new: `COALESCE(schema -> 'settings', '{}'::jsonb)`
 2. added publish authorization guard inside function:
+   - `p_published_by` must equal `(SELECT auth.uid())`
    - workspace must be in `private.user_editable_workspace_ids()`
    - unauthorized call raises SQLSTATE `42501`
 3. function execution hardening:
    - `REVOKE ALL ON FUNCTION public.publish_form(UUID, UUID, TEXT) FROM PUBLIC`
    - `GRANT EXECUTE ON FUNCTION public.publish_form(UUID, UUID, TEXT) TO authenticated`
+4. SECURITY DEFINER hardening:
+   - trigger SECURITY DEFINER functions use `SET search_path = ''`
+   - `submit_form(...)` enforces request JWT role `service_role` in-function
+   - `REVOKE CREATE ON SCHEMA public FROM PUBLIC` to reduce object-shadowing risk
 
 Runner contract additions in V2:
 1. `get_published_form_by_id(UUID)`:
@@ -554,12 +570,22 @@ Runner contract additions in V2:
     - resolves workspace from form id
     - returns `max_submissions_monthly` entitlement + current monthly usage
 3. execute privilege hardening:
-   - `check_request()`: revoked from `PUBLIC`, granted to `anon, authenticated`
+   - `check_request()`: revoked from `PUBLIC`, granted to `anon` only
    - `submit_form(...)`: revoked from `PUBLIC`, granted to `service_role`
+   - `get_workspace_entitlements(UUID)`: revoked from `PUBLIC, anon, authenticated`; granted to `authenticated, service_role`
+   - `get_published_form(TEXT, TEXT)`: revoked from `PUBLIC`; granted to `anon, authenticated`
    - runner helper functions revoked from `PUBLIC`, granted to `anon, authenticated`
 4. submission table hardening:
    - removed permissive insert policy (`WITH CHECK (true)`) on `public.form_submissions`
    - revoked direct `INSERT` on `public.form_submissions` from `anon` and `authenticated`
+
+RLS initplan wrapper hardening in V2:
+1. all policies that use `private.user_workspace_ids()`, `private.user_editable_workspace_ids()`, or `private.user_admin_workspace_ids()` now use:
+   - `= ANY(ARRAY(SELECT ...))`
+2. `publish_form(...)` authorization check now uses:
+   - `NOT (v_workspace_id = ANY(ARRAY(SELECT private.user_editable_workspace_ids())))`
+3. no new `workspace_id` indexes were added in this hardening pass:
+   - active schema already has leading `workspace_id` B-tree coverage for RLS paths (`workspace_members`, `forms`, `subscriptions`)
 
 Migration source file:
 1. `project-info-docs/migrations/2026-02-23_fix_publish_form.sql`
@@ -570,6 +596,8 @@ Migration source file:
 6. `project-info-docs/migrations/2026-02-26_stripe_customer_mapping_recovery_v3.sql`
 7. `project-info-docs/migrations/2026-02-26_stripe_incomplete_status_v4.sql`
 8. `project-info-docs/migrations/2026-02-27_runner_submission_gateway_hardening_v1.sql`
+9. `project-info-docs/migrations/2026-02-27_security_definer_hardening_v2.sql`
+10. `project-info-docs/migrations/2026-03-02_rls_initplan_wrapper_hardening_v1.sql`
 
 ## 11. Implementation Files Added or Updated
 Updated:
@@ -595,9 +623,11 @@ Added:
 6. `project-info-docs/migrations/2026-02-26_stripe_customer_mapping_recovery_v3.sql`
 7. `project-info-docs/migrations/2026-02-26_stripe_incomplete_status_v4.sql`
 8. `project-info-docs/migrations/2026-02-27_runner_submission_gateway_hardening_v1.sql`
-9. `project-info-docs/stripe-implementation.md`
-10. `runner-api-beta.md`
-11. `test-runner-public-v1.md`
+9. `project-info-docs/migrations/2026-02-27_security_definer_hardening_v2.sql`
+10. `project-info-docs/migrations/2026-03-02_rls_initplan_wrapper_hardening_v1.sql`
+11. `project-info-docs/stripe-implementation.md`
+12. `runner-api-beta.md`
+13. `test-runner-public-v1.md`
 
 ## 12. Operational Runbook
 For fresh database setup:
@@ -609,11 +639,13 @@ For existing V1 environments:
 2. execute `project-info-docs/migrations/2026-02-23_runner_public_api_v1.sql`
 3. execute `project-info-docs/migrations/2026-02-24_runner_strict_submit_rate_limit.sql`
 4. execute `project-info-docs/migrations/2026-02-27_runner_submission_gateway_hardening_v1.sql`
-5. execute `project-info-docs/migrations/2026-02-24_stripe_checkout_portal_v1.sql`
-6. execute `project-info-docs/migrations/2026-02-25_stripe_billing_hardening_v2.sql`
-7. execute `project-info-docs/migrations/2026-02-26_stripe_customer_mapping_recovery_v3.sql`
-8. execute `project-info-docs/migrations/2026-02-26_stripe_incomplete_status_v4.sql`
-9. verify function privileges, webhook lease reclaim, checkout idempotency, customer-recovery audit behavior, and pending-payment status handling
+5. execute `project-info-docs/migrations/2026-02-27_security_definer_hardening_v2.sql`
+6. execute `project-info-docs/migrations/2026-02-24_stripe_checkout_portal_v1.sql`
+7. execute `project-info-docs/migrations/2026-02-25_stripe_billing_hardening_v2.sql`
+8. execute `project-info-docs/migrations/2026-02-26_stripe_customer_mapping_recovery_v3.sql`
+9. execute `project-info-docs/migrations/2026-02-26_stripe_incomplete_status_v4.sql`
+10. execute `project-info-docs/migrations/2026-03-02_rls_initplan_wrapper_hardening_v1.sql`
+11. verify function privileges, search-path hardening, webhook lease reclaim, checkout idempotency, customer-recovery audit behavior, pending-payment status handling, and RLS initplan wrapper predicates
 
 Emergency rollback (Stripe v2 -> Stripe v1):
 1. roll back backend code to the last Stripe v1 git revision
@@ -633,9 +665,84 @@ WHERE routine_schema = 'public'
       'check_request',
       'get_published_form_by_id',
       'get_form_submission_quota',
-      'ensure_free_subscription_for_workspace',
-      'claim_stripe_webhook_event'
+       'ensure_free_subscription_for_workspace',
+       'claim_stripe_webhook_event'
   );
+
+-- ensure no touched policy still contains raw helper form:
+--   IN (SELECT private.user_*_workspace_ids())
+SELECT tablename, policyname
+FROM pg_policies
+WHERE schemaname = 'public'
+  AND policyname IN (
+      'Users can view workspace co-members',
+      'Users can view their workspaces',
+      'Members can view workspace members',
+      'Admins can add members',
+      'Admins can update members',
+      'Admins can remove members',
+      'Members can view workspace forms',
+      'Editors can create forms',
+      'Editors can update forms',
+      'Admins can delete forms',
+      'Members can view form versions',
+      'Members can view submissions',
+      'Editors can update submissions',
+      'Admins can delete submissions',
+      'Members can view workspace subscriptions'
+  )
+  AND (
+      COALESCE(qual, '') ~ 'IN \\(SELECT private\\.user_(workspace|editable_workspace|admin_workspace)_ids\\(\\)\\)'
+      OR COALESCE(with_check, '') ~ 'IN \\(SELECT private\\.user_(workspace|editable_workspace|admin_workspace)_ids\\(\\)\\)'
+  );
+
+-- ensure touched policies use wrapper form:
+--   ANY(ARRAY(SELECT private.user_*_workspace_ids()))
+SELECT tablename, policyname
+FROM pg_policies
+WHERE schemaname = 'public'
+  AND policyname IN (
+      'Users can view workspace co-members',
+      'Users can view their workspaces',
+      'Members can view workspace members',
+      'Admins can add members',
+      'Admins can update members',
+      'Admins can remove members',
+      'Members can view workspace forms',
+      'Editors can create forms',
+      'Editors can update forms',
+      'Admins can delete forms',
+      'Members can view form versions',
+      'Members can view submissions',
+      'Editors can update submissions',
+      'Admins can delete submissions',
+      'Members can view workspace subscriptions'
+  )
+  AND NOT (
+      COALESCE(qual, '') ~ 'ANY\\(ARRAY\\(SELECT private\\.user_(workspace|editable_workspace|admin_workspace)_ids\\(\\)\\)\\)'
+      OR COALESCE(with_check, '') ~ 'ANY\\(ARRAY\\(SELECT private\\.user_(workspace|editable_workspace|admin_workspace)_ids\\(\\)\\)\\)'
+  );
+
+-- verify leading workspace_id index coverage for core RLS paths
+SELECT tablename, indexname, indexdef
+FROM pg_indexes
+WHERE schemaname = 'public'
+  AND tablename IN ('workspace_members', 'forms', 'subscriptions')
+  AND indexdef ~* '\\(workspace_id(,|\\))';
+
+-- representative RLS execution plans (run as authenticated role/session)
+EXPLAIN (ANALYZE, BUFFERS, VERBOSE)
+SELECT id, workspace_id, status, updated_at
+FROM public.forms
+ORDER BY updated_at DESC
+LIMIT 50;
+
+EXPLAIN (ANALYZE, BUFFERS, VERBOSE)
+SELECT s.id, s.form_id, s.created_at
+FROM public.form_submissions s
+JOIN public.forms f ON f.id = s.form_id
+ORDER BY s.created_at DESC
+LIMIT 50;
 ```
 
 ## 13. Development Commands
