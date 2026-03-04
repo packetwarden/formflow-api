@@ -1,7 +1,7 @@
-# Stripe Billing Implementation (Hosted Checkout + Portal + Webhook Recovery) - v4
+# Stripe Billing Implementation (Hosted Checkout + Portal + Webhook Recovery) - v5
 
-Version: v4  
-Last Updated: February 26, 2026  
+Version: v5  
+Last Updated: March 4, 2026  
 Stripe API Version: `2026-01-28.clover`
 
 ## 1) Architecture Overview
@@ -17,8 +17,9 @@ Primary flow:
 3. Worker self-heals stale mappings and retries once if Stripe rejects the customer reference.
 4. Checkout creates Stripe-hosted subscription session for `pro` and `business`.
 5. Webhook verifies signature, stores idempotently, and processes via lease-based claims.
-6. Subscription sync updates `subscriptions` and refreshes `workspaces.plan`.
-7. Scheduled jobs replay failed events, reclaim stale claims, enforce grace downgrades, sync catalog, and clean completed webhook rows.
+6. Subscription sync applies snapshots through `apply_stripe_subscription_snapshot(...)`; `subscriptions` remains authoritative.
+7. `workspaces.plan` stays as UI cache and is synchronized transactionally by DB trigger/reconcile RPC.
+8. Scheduled jobs replay failed events, reclaim stale claims, enforce grace downgrades, sync catalog, clean completed webhook rows, and reconcile plan-cache drift.
 
 Design principles:
 1. Stripe payloads are untrusted and size-guarded.
@@ -26,6 +27,8 @@ Design principles:
 3. Stripe catalog is source of truth for recurring self-serve prices.
 4. Checkout idempotency is durable via `stripe_checkout_idempotency`.
 5. Customer mappings are validated at runtime, not blindly trusted from DB.
+6. Webhook ordering races are guarded with Stripe event watermark fields on `subscriptions`.
+7. Worker never performs direct dual writes to `workspaces.plan`.
 
 ## 2) Environment Variables and Wrangler Bindings
 Required:
@@ -55,7 +58,7 @@ Wrangler schedule defaults:
 1. `*/5 * * * *` webhook replay + stale claim reclaim
 2. `0 * * * *` grace downgrade pass
 3. `*/15 * * * *` catalog sync
-4. `30 2 * * *` webhook cleanup
+4. `30 2 * * *` webhook cleanup + `reconcile_workspace_plan_cache(...)`
 
 ## 3) Checkout Idempotency Contract
 Checkout requires `Idempotency-Key` (UUID).
@@ -119,6 +122,12 @@ Lifecycle:
 3. On success: `completed`, `processed_at`, clear claim fields.
 4. On failure: `failed`, set `last_error`, schedule `next_attempt_at` with backoff.
 
+Subscription snapshot persistence:
+1. Worker fetches latest Stripe subscription state for lifecycle webhook events before DB apply.
+2. Worker calls `apply_stripe_subscription_snapshot(...)` (single transactional writer).
+3. RPC uses workspace advisory lock + stale-event watermark guard + conflict demotion.
+4. `workspaces.plan` cache is refreshed in the same DB transaction via subscriptions trigger.
+
 ## 7) Event Mapping and Status Rules
 Handled events:
 1. `checkout.session.completed`
@@ -140,16 +149,16 @@ Handled events:
 1. Delete matching rows in `workspace_billing_customers`.
 2. Cancel workspace subscriptions tied to deleted `stripe_customer_id`.
 3. Write `workspace_billing_customer_events` with `event_type = webhook_deleted`.
-4. Ensure free subscription and refresh `workspaces.plan`.
+4. Converge to implicit free access; `workspaces.plan` converges via DB trigger/reconcile (no synthetic free-row insert).
 
 Status mapping:
 1. `trialing -> trialing`
 2. `active -> active`
 3. `past_due -> past_due`
-4. `unpaid -> unpaid` (non-entitled, free-tier ensure)
-5. `paused -> paused` (non-entitled, free-tier ensure)
-6. `canceled -> canceled` (free-tier ensure)
-7. `incomplete_expired -> incomplete_expired` (terminal non-entitled, free-tier ensure)
+4. `unpaid -> unpaid` (non-entitled, implicit free convergence via DB-triggered cache sync)
+5. `paused -> paused` (non-entitled, implicit free convergence via DB-triggered cache sync)
+6. `canceled -> canceled` (implicit free convergence via DB-triggered cache sync)
+7. `incomplete_expired -> incomplete_expired` (terminal non-entitled, implicit free convergence)
 8. `incomplete -> incomplete` (payment pending, non-entitled)
 
 Transition safety:
@@ -159,7 +168,7 @@ Invoice behavior:
 1. `invoice.payment_failed` sets `grace_period_end` only.
 2. `invoice.payment_action_required` and `invoice.payment_attempt_required` are treated as payment-action-required equivalents and set `grace_period_end`.
 3. `invoice.paid` clears `grace_period_end`.
-4. `invoice.finalization_failed` enforces immediate local entitlement removal by setting `status = unpaid`, ensuring free-tier row, and refreshing `workspaces.plan`.
+4. `invoice.finalization_failed` enforces immediate local entitlement removal by setting `status = unpaid`; plan cache converges through DB trigger/reconcile.
 5. `invoice.created` returns `200` immediately after signature verification and is intentionally not inserted into the durable webhook queue to avoid Stripe finalization delays.
 
 ## 8) Stale Customer Mapping Recovery Runbook
@@ -201,9 +210,11 @@ Manual intervention criteria:
 1. Apply migration `2026-02-25_stripe_billing_hardening_v2.sql`.
 2. Apply migration `2026-02-26_stripe_customer_mapping_recovery_v3.sql`.
 3. Apply migration `2026-02-26_stripe_incomplete_status_v4.sql`.
-4. Verify one Stripe customer mapping per workspace.
-5. Verify customer audit rows are written to `workspace_billing_customer_events`.
-6. Configure and verify Stripe secrets and URLs.
-7. Ensure webhook subscription includes all required lifecycle events (`customer.deleted`, `customer.subscription.deleted|paused|resumed|trial_will_end`, `invoice.created`, `invoice.payment_action_required`, `invoice.finalization_failed`).
-8. Run test-mode checkout + portal + webhook + replay + stale-customer recovery + pending status scenarios.
-9. Monitor failures/retries/audit events for first 48 hours.
+4. Apply migration `2026-03-04_implicit_free_entitlements_v5.sql`.
+5. Apply migration `2026-03-04_stripe_plan_cache_consistency_v6.sql`.
+6. Verify one Stripe customer mapping per workspace.
+7. Verify customer audit rows are written to `workspace_billing_customer_events`.
+8. Configure and verify Stripe secrets and URLs.
+9. Ensure webhook subscription includes all required lifecycle events (`customer.deleted`, `customer.subscription.deleted|paused|resumed|trial_will_end`, `invoice.created`, `invoice.payment_action_required`, `invoice.finalization_failed`).
+10. Run test-mode checkout + portal + webhook + replay + stale-customer recovery + pending status scenarios.
+11. Monitor failures/retries/audit events for first 48 hours, including stale-event skip logs and plan-cache drift reconciliation logs.

@@ -9,6 +9,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 ## [Unreleased]
 
 ### Added
+- **Stripe Plan Cache Consistency Hardening v6**: Added `project-info-docs/migrations/2026-03-04_stripe_plan_cache_consistency_v6.sql` with subscription event watermark fields, transactional `apply_stripe_subscription_snapshot(...)` RPC, DB-triggered `workspaces.plan` cache refresh, and `reconcile_workspace_plan_cache(...)` drift-repair RPC.
 - **Implicit-Free Entitlements Refactor v5**: Added `project-info-docs/migrations/2026-03-04_implicit_free_entitlements_v5.sql` to remove synthetic free-subscription rows, drop free-row trigger/RPC artifacts, and make entitlement resolution fall back to free plan when no entitled subscription exists.
 - **Stripe Webhook Coverage Hardening v4.1**: Expanded webhook handling in `src/routes/stripe/index.ts` for `invoice.payment_action_required` (plus forward-compatible `invoice.payment_attempt_required` alias), `invoice.finalization_failed`, `customer.subscription.paused`, `customer.subscription.resumed`, and `customer.subscription.trial_will_end`; added signature-verified fast-ack behavior for `invoice.created` (`200` without durable queue insert).
 - **RLS InitPlan Wrapper Hardening v1**: Added `project-info-docs/migrations/2026-03-02_rls_initplan_wrapper_hardening_v1.sql`, rewrote workspace helper predicates in RLS policies to `= ANY(ARRAY(SELECT ...))`, and aligned `publish_form(...)` workspace authorization guard to wrapper form for statement-level initplan caching behavior.
@@ -69,6 +70,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 - **Developer Documentation**: Authored `dev-docs.md` outlining the API routing strategy, architectural philosophy ("Thick Database, Thin Edge"), and edge coding standards.
 
 ### Changed
+- **Plan Cache Authority Model**: `subscriptions` remains authoritative while `workspaces.plan` is now treated as UI cache only and synchronized by database trigger/transactional RPC instead of worker-side dual writes.
+- **Subscription Webhook State Sync**: `customer.subscription.*` and `customer.subscription.trial_will_end` now fetch the latest subscription snapshot from Stripe API before applying DB state, with stale-event watermark guarding.
+- **Daily Drift Reconciliation**: Daily maintenance cron (`30 2 * * *`) now runs cache reconciliation after webhook cleanup and logs drift count plus sampled workspace IDs when mismatches are fixed.
 - **Workspace Customer Resolution Policy**: Checkout and portal now validate mapped Stripe customers on every request and no longer trust stale DB mapping blindly.
 - **Customer Create Idempotency Strategy**: Customer creation idempotency key changed from workspace-static (`customer:v1`) to request-scoped (`customer:v2`) to prevent replay of deleted customer IDs.
 - **Catalog Sync Clarification**: `/api/v1/stripe/catalog/sync` is explicitly catalog-only and does not repair customer mappings.

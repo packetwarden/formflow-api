@@ -132,6 +132,32 @@ type CatalogCandidate = {
     created: number
 }
 
+type StripeEventContext = {
+    id: string
+    type: string
+    created: number
+}
+
+type ApplyStripeSnapshotRpcRow = {
+    subscription_id: string
+    workspace_id: string
+    status: MappedSubscriptionStatus
+    applied: boolean
+    stale: boolean
+    reason: string | null
+}
+
+type ReconcileWorkspacePlanCacheRow = {
+    workspace_id: string
+    previous_plan: string | null
+    expected_plan: string
+}
+
+type FinalizationEnforcementResult = {
+    workspaceId: string | null
+    stale: boolean
+}
+
 class CatalogOutOfSyncError extends Error {
     code = 'CATALOG_OUT_OF_SYNC' as const
 }
@@ -242,16 +268,6 @@ const mapStripeSubscriptionStatus = (status: Stripe.Subscription.Status): Mapped
 
 const shouldConvergeImplicitFreeAccess = (status: MappedSubscriptionStatus) =>
     (NON_ENTITLED_TERMINAL_STATUSES as readonly string[]).includes(status)
-
-const isEntitledSubscriptionStatus = (
-    status: string
-): status is (typeof ENTITLED_SUBSCRIPTION_STATUSES)[number] =>
-    (ENTITLED_SUBSCRIPTION_STATUSES as readonly string[]).includes(status)
-
-const isManageableSubscriptionStatus = (
-    status: string
-): status is (typeof MANAGEABLE_SUBSCRIPTION_STATUSES)[number] =>
-    (MANAGEABLE_SUBSCRIPTION_STATUSES as readonly string[]).includes(status)
 
 const digestSha256Hex = async (value: string) => {
     const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(value))
@@ -403,29 +419,6 @@ const extractCatalogCandidate = (
         amountCents: price.unit_amount,
         created: price.created ?? 0,
     }
-}
-
-const refreshWorkspacePlanCache = async (env: Env, workspaceId: string) => {
-    const supabase = getServiceSupabase(env)
-    const { data: activeRows, error: activeError } = await supabase
-        .from('subscriptions')
-        .select('plan:plans!subscriptions_plan_id_fkey(slug)')
-        .eq('workspace_id', workspaceId)
-        .in('status', [...ENTITLED_SUBSCRIPTION_STATUSES])
-        .order('created_at', { ascending: false })
-        .limit(1)
-
-    if (activeError) throw new Error(`Failed to resolve entitled plan: ${activeError.message}`)
-
-    const plan = activeRows?.[0]?.plan as { slug: string } | { slug: string }[] | null | undefined
-    const nextPlanSlug = Array.isArray(plan) ? plan[0]?.slug : plan?.slug
-
-    const { error: workspaceError } = await supabase
-        .from('workspaces')
-        .update({ plan: nextPlanSlug ?? FREE_PLAN_SLUG })
-        .eq('id', workspaceId)
-
-    if (workspaceError) throw new Error(`Failed to update workspace plan cache: ${workspaceError.message}`)
 }
 
 const findEntitledPaidSubscription = async (env: Env, workspaceId: string) => {
@@ -1109,118 +1102,81 @@ const resolvePlanVariantFromSubscription = async (
 const upsertWorkspaceSubscriptionState = async (
     env: Env,
     workspaceId: string,
-    subscription: Stripe.Subscription
+    subscription: Stripe.Subscription,
+    eventContext?: StripeEventContext
 ) => {
     const supabase = getServiceSupabase(env)
     const existingByStripeId = await fetchExistingSubscriptionByStripeId(env, subscription.id)
     const planVariant = await resolvePlanVariantFromSubscription(env, subscription, existingByStripeId)
     const mappedStatus = mapStripeSubscriptionStatus(subscription.status)
-    if (!isManageableSubscriptionStatus(mappedStatus) && mappedStatus !== 'canceled') {
-        throw new Error(`Unsupported mapped subscription status "${mappedStatus}"`)
-    }
     const nowIso = new Date().toISOString()
 
     const currentPeriodStart = subscription.items.data[0]?.current_period_start
     const currentPeriodEnd = subscription.items.data[0]?.current_period_end
-
-    const payload = {
-        workspace_id: workspaceId,
-        plan_id: planVariant.plan_id,
-        plan_variant_id: planVariant.id,
-        status: mappedStatus,
-        stripe_subscription_id: subscription.id,
-        stripe_customer_id: resolveStripeCustomerId(subscription.customer),
-        current_period_start: toIsoFromUnix(currentPeriodStart) ?? nowIso,
-        current_period_end: toIsoFromUnix(currentPeriodEnd) ?? nowIso,
-        trial_start: toIsoFromUnix(subscription.trial_start),
-        trial_end: toIsoFromUnix(subscription.trial_end),
-        cancel_at_period_end: subscription.cancel_at_period_end ?? false,
-        canceled_at: toIsoFromUnix(subscription.canceled_at),
-        ended_at: toIsoFromUnix(subscription.ended_at),
-        metadata: {
+    const { data, error } = await supabase.rpc('apply_stripe_subscription_snapshot', {
+        p_workspace_id: workspaceId,
+        p_plan_id: planVariant.plan_id,
+        p_plan_variant_id: planVariant.id,
+        p_status: mappedStatus,
+        p_stripe_subscription_id: subscription.id,
+        p_stripe_customer_id: resolveStripeCustomerId(subscription.customer),
+        p_current_period_start: toIsoFromUnix(currentPeriodStart) ?? nowIso,
+        p_current_period_end: toIsoFromUnix(currentPeriodEnd) ?? nowIso,
+        p_trial_start: toIsoFromUnix(subscription.trial_start),
+        p_trial_end: toIsoFromUnix(subscription.trial_end),
+        p_cancel_at_period_end: subscription.cancel_at_period_end ?? false,
+        p_canceled_at: toIsoFromUnix(subscription.canceled_at),
+        p_ended_at: toIsoFromUnix(subscription.ended_at),
+        p_grace_period_end: null,
+        p_metadata: {
             stripe_status: subscription.status,
             stripe_price_id: subscription.items.data[0]?.price?.id ?? null,
             source: 'stripe-webhook',
+            stripe_event_id: eventContext?.id ?? null,
+            stripe_event_type: eventContext?.type ?? null,
         },
-    }
+        p_stripe_event_id: eventContext?.id ?? null,
+        p_stripe_event_type: eventContext?.type ?? null,
+        p_stripe_event_created_at: eventContext ? toIsoFromUnix(eventContext.created) : null,
+    })
 
-    if (existingByStripeId) {
-        if (isEntitledSubscriptionStatus(mappedStatus)) {
-            const { data: conflictingEntitledRows, error: conflictingEntitledError } = await supabase
-                .from('subscriptions')
-                .select('id, metadata')
-                .eq('workspace_id', workspaceId)
-                .in('status', [...ENTITLED_SUBSCRIPTION_STATUSES])
-                .neq('id', existingByStripeId.id)
+    if (error) throw new Error(`Failed to apply Stripe subscription snapshot: ${error.message}`)
 
-            if (conflictingEntitledError) {
-                throw new Error(`Failed to resolve conflicting entitled subscriptions: ${conflictingEntitledError.message}`)
-            }
+    const row = (Array.isArray(data) ? data[0] : data) as ApplyStripeSnapshotRpcRow | null | undefined
+    if (!row) throw new Error('Failed to apply Stripe subscription snapshot: missing RPC result row')
 
-            for (const row of conflictingEntitledRows ?? []) {
-                const existingMetadata = row.metadata && typeof row.metadata === 'object' && !Array.isArray(row.metadata)
-                    ? row.metadata as Record<string, unknown>
-                    : {}
-
-                const { error: demoteError } = await supabase
-                    .from('subscriptions')
-                    .update({
-                        status: 'canceled',
-                        canceled_at: nowIso,
-                        ended_at: nowIso,
-                        cancel_at_period_end: false,
-                        metadata: {
-                            ...existingMetadata,
-                            source: 'stripe-webhook',
-                            reason: 'superseded_by_entitled_stripe_subscription',
-                            replacement_stripe_subscription_id: subscription.id,
-                        },
-                    })
-                    .eq('id', row.id)
-
-                if (demoteError) {
-                    throw new Error(`Failed to demote conflicting entitled subscription: ${demoteError.message}`)
-                }
-            }
-        }
-
-        const { error } = await supabase.from('subscriptions').update(payload).eq('id', existingByStripeId.id)
-        if (error) throw new Error(`Failed to update subscription by Stripe ID: ${error.message}`)
+    if (row.stale) {
+        logStripe('warn', 'Stripe subscription snapshot skipped as stale', {
+            workspace_id: workspaceId,
+            stripe_subscription_id: subscription.id,
+            event_id: eventContext?.id ?? null,
+            event_type: eventContext?.type ?? null,
+            reason: row.reason,
+        })
         return mappedStatus
     }
 
-    if (isEntitledSubscriptionStatus(mappedStatus)) {
-        const { data: entitledRows, error: entitledError } = await supabase
-            .from('subscriptions')
-            .select('id')
-            .eq('workspace_id', workspaceId)
-            .in('status', [...ENTITLED_SUBSCRIPTION_STATUSES])
-            .order('created_at', { ascending: false })
-            .limit(1)
-        if (entitledError) throw new Error(`Failed to resolve entitled workspace subscription: ${entitledError.message}`)
+    logStripe('info', 'Stripe subscription snapshot applied via DB RPC', {
+        workspace_id: workspaceId,
+        stripe_subscription_id: subscription.id,
+        status: mappedStatus,
+        event_id: eventContext?.id ?? null,
+        event_type: eventContext?.type ?? null,
+    })
 
-        const entitledRowId = entitledRows?.[0]?.id
-        if (entitledRowId) {
-            const { error } = await supabase.from('subscriptions').update(payload).eq('id', entitledRowId)
-            if (error) throw new Error(`Failed to update entitled workspace subscription: ${error.message}`)
-            return mappedStatus
-        }
-    }
-
-    const { error: insertError } = await supabase.from('subscriptions').insert(payload)
-    if (insertError) throw new Error(`Failed to insert workspace subscription: ${insertError.message}`)
     return mappedStatus
 }
 
 const syncSubscriptionFromStripe = async (
     env: Env,
     subscription: Stripe.Subscription,
-    workspaceHint?: string | null
+    workspaceHint?: string | null,
+    eventContext?: StripeEventContext
 ) => {
     const workspaceId = await resolveWorkspaceIdForSubscription(env, subscription, workspaceHint)
     if (!workspaceId) throw new Error(`Unable to resolve workspace for Stripe subscription "${subscription.id}"`)
 
-    const mappedStatus = await upsertWorkspaceSubscriptionState(env, workspaceId, subscription)
+    const mappedStatus = await upsertWorkspaceSubscriptionState(env, workspaceId, subscription, eventContext)
     if (shouldConvergeImplicitFreeAccess(mappedStatus)) {
         logStripe('info', 'Converging workspace to implicit free access for non-entitled terminal status', {
             workspace_id: workspaceId,
@@ -1228,7 +1184,6 @@ const syncSubscriptionFromStripe = async (
             mapped_status: mappedStatus,
         })
     }
-    await refreshWorkspacePlanCache(env, workspaceId)
     return workspaceId
 }
 
@@ -1238,16 +1193,12 @@ const setGracePeriodForSubscription = async (
     gracePeriodEnd: string | null
 ) => {
     const supabase = getServiceSupabase(env)
-    const { data: rows, error } = await supabase
+    const { error } = await supabase
         .from('subscriptions')
         .update({ grace_period_end: gracePeriodEnd })
         .eq('stripe_subscription_id', stripeSubscriptionId)
-        .select('workspace_id')
 
     if (error) throw new Error(`Failed to update subscription grace period: ${error.message}`)
-
-    const workspaceId = rows?.[0]?.workspace_id
-    if (workspaceId) await refreshWorkspacePlanCache(env, workspaceId)
 }
 
 const getInvoiceSubscriptionId = (invoice: Stripe.Invoice) => {
@@ -1267,13 +1218,14 @@ const getInvoiceSubscriptionId = (invoice: Stripe.Invoice) => {
 const syncSubscriptionFromInvoice = async (
     env: Env,
     stripe: Stripe,
-    invoice: Stripe.Invoice
+    invoice: Stripe.Invoice,
+    eventContext?: StripeEventContext
 ) => {
     const subscriptionId = getInvoiceSubscriptionId(invoice)
     if (!subscriptionId) return null
 
     const subscription = await stripe.subscriptions.retrieve(subscriptionId)
-    const workspaceId = await syncSubscriptionFromStripe(env, subscription)
+    const workspaceId = await syncSubscriptionFromStripe(env, subscription, undefined, eventContext)
     return {
         subscriptionId,
         workspaceId,
@@ -1285,12 +1237,13 @@ const enforceUnpaidStatusAndImplicitFreeAccess = async (
     env: Env,
     stripeSubscriptionId: string,
     stripeEventId: string,
-    stripeEventType: string
-) => {
+    stripeEventType: string,
+    stripeEventCreatedAt?: number
+): Promise<FinalizationEnforcementResult> => {
     const supabase = getServiceSupabase(env)
     const { data: row, error: rowError } = await supabase
         .from('subscriptions')
-        .select('id, workspace_id, metadata')
+        .select('id, workspace_id, plan_id, plan_variant_id, stripe_customer_id, current_period_start, current_period_end, trial_start, trial_end, canceled_at, ended_at, metadata')
         .eq('stripe_subscription_id', stripeSubscriptionId)
         .maybeSingle()
 
@@ -1304,31 +1257,56 @@ const enforceUnpaidStatusAndImplicitFreeAccess = async (
             stripe_event_id: stripeEventId,
             stripe_event_type: stripeEventType,
         })
-        return null
+        return { workspaceId: null, stale: false }
     }
 
     const existingMetadata = row.metadata && typeof row.metadata === 'object' && !Array.isArray(row.metadata)
         ? row.metadata as Record<string, unknown>
         : {}
 
-    const { error: updateError } = await supabase
-        .from('subscriptions')
-        .update({
-            status: 'unpaid',
-            grace_period_end: null,
-            cancel_at_period_end: false,
-            metadata: {
-                ...existingMetadata,
-                source: 'stripe-webhook',
-                reason: 'invoice_finalization_failed',
-                stripe_event_id: stripeEventId,
-                stripe_event_type: stripeEventType,
-            },
-        })
-        .eq('id', row.id)
+    const mergedMetadata = {
+        ...existingMetadata,
+        source: 'stripe-webhook',
+        reason: 'invoice_finalization_failed',
+        stripe_event_id: stripeEventId,
+        stripe_event_type: stripeEventType,
+    }
 
-    if (updateError) {
-        throw new Error(`Failed to enforce unpaid status after invoice finalization failure: ${updateError.message}`)
+    const { data: applyData, error: applyError } = await supabase.rpc('apply_stripe_subscription_snapshot', {
+        p_workspace_id: row.workspace_id,
+        p_plan_id: row.plan_id,
+        p_plan_variant_id: row.plan_variant_id,
+        p_status: 'unpaid',
+        p_stripe_subscription_id: stripeSubscriptionId,
+        p_stripe_customer_id: row.stripe_customer_id,
+        p_current_period_start: row.current_period_start,
+        p_current_period_end: row.current_period_end,
+        p_trial_start: row.trial_start,
+        p_trial_end: row.trial_end,
+        p_cancel_at_period_end: false,
+        p_canceled_at: row.canceled_at,
+        p_ended_at: row.ended_at,
+        p_grace_period_end: null,
+        p_metadata: mergedMetadata,
+        p_stripe_event_id: stripeEventId,
+        p_stripe_event_type: stripeEventType,
+        p_stripe_event_created_at: toIsoFromUnix(stripeEventCreatedAt),
+    })
+
+    if (applyError) {
+        throw new Error(`Failed to enforce unpaid status after invoice finalization failure: ${applyError.message}`)
+    }
+
+    const applyRow = (Array.isArray(applyData) ? applyData[0] : applyData) as ApplyStripeSnapshotRpcRow | null | undefined
+    if (applyRow?.stale) {
+        logStripe('warn', 'invoice.finalization_failed enforcement skipped due to stale watermark', {
+            workspace_id: row.workspace_id,
+            stripe_subscription_id: stripeSubscriptionId,
+            stripe_event_id: stripeEventId,
+            stripe_event_type: stripeEventType,
+            reason: applyRow.reason,
+        })
+        return { workspaceId: row.workspace_id, stale: true }
     }
 
     logStripe('info', 'Converging workspace to implicit free access after invoice finalization failure', {
@@ -1337,8 +1315,7 @@ const enforceUnpaidStatusAndImplicitFreeAccess = async (
         stripe_event_id: stripeEventId,
         stripe_event_type: stripeEventType,
     })
-    await refreshWorkspacePlanCache(env, row.workspace_id)
-    return row.workspace_id
+    return { workspaceId: row.workspace_id, stale: false }
 }
 
 const cancelWorkspaceSubscriptionsForDeletedCustomer = async (
@@ -1445,13 +1422,17 @@ const handleDeletedStripeCustomer = async (
             stripe_customer_id: customerId,
             stripe_event_id: stripeEventId,
         })
-        await refreshWorkspacePlanCache(env, workspaceId)
     }
 }
 
 const processStripeEvent = async (env: Env, event: Stripe.Event) => {
     const stripe = getStripeClient(env)
     const eventType = event.type as string
+    const eventContext: StripeEventContext = {
+        id: event.id,
+        type: eventType,
+        created: event.created,
+    }
 
     if (eventType === 'checkout.session.completed') {
         const session = event.data.object as Stripe.Checkout.Session
@@ -1465,7 +1446,8 @@ const processStripeEvent = async (env: Env, event: Stripe.Event) => {
         await syncSubscriptionFromStripe(
             env,
             subscription,
-            typeof session.metadata?.workspace_id === 'string' ? session.metadata.workspace_id : null
+            typeof session.metadata?.workspace_id === 'string' ? session.metadata.workspace_id : null,
+            eventContext
         )
         return
     }
@@ -1480,19 +1462,38 @@ const processStripeEvent = async (env: Env, event: Stripe.Event) => {
     }
 
     if (SUBSCRIPTION_SYNC_EVENT_TYPES.has(eventType)) {
-        await syncSubscriptionFromStripe(env, event.data.object as Stripe.Subscription)
+        const payload = event.data.object as Stripe.Subscription
+        if (!payload?.id) {
+            logStripe('warn', 'Subscription webhook payload missing subscription id', {
+                event_id: event.id,
+                event_type: eventType,
+            })
+            return
+        }
+
+        const latestSubscription = await stripe.subscriptions.retrieve(payload.id)
+        await syncSubscriptionFromStripe(env, latestSubscription, undefined, eventContext)
         return
     }
 
     if (eventType === SUBSCRIPTION_TRIAL_WILL_END_EVENT) {
-        const subscription = event.data.object as Stripe.Subscription
-        const workspaceId = await syncSubscriptionFromStripe(env, subscription)
+        const payload = event.data.object as Stripe.Subscription
+        if (!payload?.id) {
+            logStripe('warn', 'trial_will_end payload missing subscription id', {
+                event_id: event.id,
+                event_type: eventType,
+            })
+            return
+        }
+
+        const latestSubscription = await stripe.subscriptions.retrieve(payload.id)
+        const workspaceId = await syncSubscriptionFromStripe(env, latestSubscription, undefined, eventContext)
         logStripe('info', 'Stripe trial_will_end processed', {
             event_id: event.id,
             event_type: eventType,
-            subscription_id: subscription.id,
+            subscription_id: latestSubscription.id,
             workspace_id: workspaceId,
-            trial_end: toIsoFromUnix(subscription.trial_end),
+            trial_end: toIsoFromUnix(latestSubscription.trial_end),
         })
         return
     }
@@ -1503,7 +1504,7 @@ const processStripeEvent = async (env: Env, event: Stripe.Event) => {
         || eventType === INVOICE_FINALIZATION_FAILED_EVENT
     ) {
         const invoice = event.data.object as Stripe.Invoice
-        const synced = await syncSubscriptionFromInvoice(env, stripe, invoice)
+        const synced = await syncSubscriptionFromInvoice(env, stripe, invoice, eventContext)
         if (!synced) return
 
         if (INVOICE_GRACE_SET_EVENT_TYPES.has(eventType)) {
@@ -1529,19 +1530,32 @@ const processStripeEvent = async (env: Env, event: Stripe.Event) => {
             return
         }
 
-        const enforcedWorkspaceId = await enforceUnpaidStatusAndImplicitFreeAccess(
+        const enforcement = await enforceUnpaidStatusAndImplicitFreeAccess(
             env,
             synced.subscriptionId,
             event.id,
-            eventType
+            eventType,
+            event.created
         )
+        if (enforcement.stale) {
+            logStripe('warn', 'Stripe invoice finalization_failed processed but enforcement skipped due to stale watermark', {
+                event_id: event.id,
+                event_type: eventType,
+                invoice_id: invoice.id,
+                stripe_subscription_id: synced.subscriptionId,
+                synced_workspace_id: synced.workspaceId,
+                workspace_id: enforcement.workspaceId,
+            })
+            return
+        }
+
         logStripe('warn', 'Stripe invoice finalization failed; enforced unpaid status and converged implicit free access', {
             event_id: event.id,
             event_type: eventType,
             invoice_id: invoice.id,
             stripe_subscription_id: synced.subscriptionId,
             synced_workspace_id: synced.workspaceId,
-            enforced_workspace_id: enforcedWorkspaceId,
+            enforced_workspace_id: enforcement.workspaceId,
         })
     }
 }
@@ -1704,18 +1718,10 @@ const enforceGracePeriodDowngrades = async (env: Env) => {
             continue
         }
 
-        try {
-            logStripe('info', 'Converging workspace to implicit free access after grace period expiry', {
-                workspace_id: row.workspace_id,
-                subscription_id: row.id,
-            })
-            await refreshWorkspacePlanCache(env, row.workspace_id)
-        } catch (downgradeError) {
-            logStripe('error', 'Failed to converge workspace to implicit free access after grace expiry', {
-                workspace_id: row.workspace_id,
-                error: truncateError(downgradeError),
-            })
-        }
+        logStripe('info', 'Converging workspace to implicit free access after grace period expiry', {
+            workspace_id: row.workspace_id,
+            subscription_id: row.id,
+        })
     }
 }
 
@@ -1729,6 +1735,37 @@ const cleanupWebhookHistory = async (env: Env) => {
         .lt('processed_at', cutoffIso)
 
     if (error) throw new Error(`Failed to cleanup webhook history: ${error.message}`)
+}
+
+const reconcileWorkspacePlanCache = async (
+    env: Env,
+    options?: { limit?: number; reason?: string }
+) => {
+    const supabase = getServiceSupabase(env)
+    const limit = Math.max(1, options?.limit ?? 1000)
+    const { data, error } = await supabase.rpc('reconcile_workspace_plan_cache', {
+        p_limit: limit,
+    })
+
+    if (error) throw new Error(`Failed to reconcile workspace plan cache: ${error.message}`)
+
+    const rows = (Array.isArray(data) ? data : []) as ReconcileWorkspacePlanCacheRow[]
+    const driftCount = rows.length
+    const sampleWorkspaceIds = rows.slice(0, 10).map((row) => row.workspace_id)
+
+    if (driftCount > 0) {
+        logStripe('warn', 'Workspace plan cache drift reconciled', {
+            reason: options?.reason ?? 'unspecified',
+            drift_count: driftCount,
+            sampled_workspace_ids: sampleWorkspaceIds,
+        })
+        return
+    }
+
+    logStripe('info', 'Workspace plan cache reconciliation completed without drift', {
+        reason: options?.reason ?? 'unspecified',
+        drift_count: 0,
+    })
 }
 
 const ensureInternalCatalogSyncAuth = (env: Env, token: string | undefined) => {
@@ -1757,6 +1794,7 @@ export const runStripeScheduled = async (env: Env, cron?: string) => {
 
     if (cron === WEBHOOK_CLEANUP_CRON) {
         await cleanupWebhookHistory(env)
+        await reconcileWorkspacePlanCache(env, { reason: 'daily-maintenance' })
         return
     }
 
@@ -1764,6 +1802,7 @@ export const runStripeScheduled = async (env: Env, cron?: string) => {
     await enforceGracePeriodDowngrades(env)
     await syncStripeCatalog(env, { reason: 'fallback-scheduled-catalog-sync' })
     await cleanupWebhookHistory(env)
+    await reconcileWorkspacePlanCache(env, { reason: 'fallback-scheduled-maintenance' })
 }
 
 stripeRouter.post(

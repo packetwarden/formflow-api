@@ -1,7 +1,7 @@
 # FormSandbox Stripe Billing API v1 Test Guide
 
-Version: v4  
-Last Updated: February 26, 2026  
+Version: v5  
+Last Updated: March 4, 2026  
 Target: Cloudflare Worker deployment (`/api/v1/stripe/*`)
 
 ## 1. Scope
@@ -16,7 +16,7 @@ This guide validates:
 3. enterprise self-serve rejection behavior
 4. billing portal creation behavior
 5. webhook signature verification
-6. webhook idempotency and subscription/workspace plan sync
+6. webhook idempotency, authoritative subscription sync, and trigger-coupled workspace plan cache sync
 7. payment failure grace-period behavior and recovery
 8. retry and scheduled downgrade flows
 
@@ -32,6 +32,8 @@ Before running tests:
    - `project-info-docs/migrations/2026-02-25_stripe_billing_hardening_v2.sql`
    - `project-info-docs/migrations/2026-02-26_stripe_customer_mapping_recovery_v3.sql`
    - `project-info-docs/migrations/2026-02-26_stripe_incomplete_status_v4.sql`
+   - `project-info-docs/migrations/2026-03-04_implicit_free_entitlements_v5.sql`
+   - `project-info-docs/migrations/2026-03-04_stripe_plan_cache_consistency_v6.sql`
 4. Worker bindings are configured:
    - `SUPABASE_URL`
    - `SUPABASE_ANON_KEY`
@@ -317,7 +319,7 @@ Expected:
 1. Worker returns `200`
 2. A row is created in `public.stripe_webhook_events` with `status` eventually `completed`
 3. `subscriptions` row is inserted/updated
-4. `workspaces.plan` updates to paid plan slug
+4. `workspaces.plan` updates to paid plan slug via DB-triggered cache sync
 
 Verification SQL:
 ```sql
@@ -785,6 +787,62 @@ FROM public.workspaces
 WHERE id = '<workspace_id_under_test>';
 ```
 
+### 7.37 Stale Event Watermark Guard (`customer.subscription.*`)
+Flow:
+1. Pick a Stripe-linked subscription row for a workspace under test.
+2. Set its watermark to a future timestamp:
+```sql
+UPDATE public.subscriptions
+SET last_stripe_event_created_at = now() + interval '1 day',
+    last_stripe_event_id = 'evt_future_guard',
+    last_stripe_event_type = 'customer.subscription.updated'
+WHERE stripe_subscription_id = '<stripe_subscription_id>';
+```
+3. Trigger `customer.subscription.updated` from Stripe CLI.
+
+Expected:
+1. webhook row reaches `completed`
+2. subscription row is not regressed by the stale event
+3. worker logs contain stale-skip marker (`STALE_STRIPE_EVENT_SKIPPED`)
+
+Cleanup:
+```sql
+UPDATE public.subscriptions
+SET last_stripe_event_created_at = NULL,
+    last_stripe_event_id = NULL,
+    last_stripe_event_type = NULL
+WHERE stripe_subscription_id = '<stripe_subscription_id>';
+```
+
+### 7.38 Plan Cache Drift Reconciliation RPC
+Flow:
+1. Tamper workspace cache value intentionally:
+```sql
+UPDATE public.workspaces
+SET plan = 'enterprise'
+WHERE id = '<workspace_id_under_test>';
+```
+2. Run reconciliation:
+```sql
+SELECT *
+FROM public.reconcile_workspace_plan_cache(1000)
+WHERE workspace_id = '<workspace_id_under_test>';
+```
+
+Expected:
+1. RPC returns one row with `previous_plan = 'enterprise'`
+2. `expected_plan` matches the authoritative subscription-derived plan
+3. workspace cache is corrected
+
+Verification SQL:
+```sql
+SELECT w.id,
+       w.plan AS cached_plan,
+       private.get_workspace_plan(w.id) AS authoritative_plan
+FROM public.workspaces w
+WHERE w.id = '<workspace_id_under_test>';
+```
+
 ## 8. Negative Tests Checklist
 1. Missing auth header on checkout/portal -> `401`
 2. Invalid `workspaceId` UUID -> `400`
@@ -900,17 +958,20 @@ Run in this order:
 16. Crash-safe lease reclaim (`7.20`)
 17. Catalog sync and drift checks (`7.22`, `7.23`)
 18. Customer mapping recovery checks (`7.25`, `7.26`, `7.27`, `7.28`)
+19. Stale-event watermark guard (`7.37`)
+20. Reconciliation drift repair (`7.38`)
 
 Pass criteria:
 1. Success-path requests return expected `200`.
 2. Validation and authorization violations return deterministic `4xx` codes.
 3. Webhook rows converge to `completed` after retries.
-4. `workspaces.plan` always matches active paid subscription or `free`.
+4. `workspaces.plan` (UI cache) converges to authoritative subscription-derived plan.
 5. Synthetic free subscription rows are not reintroduced (`plan='free' AND stripe_subscription_id IS NULL` stays `0`).
 6. Pending subscription statuses (`incomplete`, `incomplete_expired`) are persisted without lossy remapping.
 7. `invoice.created` returns immediate `200` via ack-only path.
 8. `invoice.finalization_failed` forces Stripe-linked row to `unpaid` and converges workspace plan to `free`.
-9. No unexpected `5xx` responses.
+9. stale webhook events are skipped deterministically when watermark indicates newer state already applied.
+10. No unexpected `5xx` responses.
 
 ## 11. Release Checklist
 1. `cmd /c npx tsc --noEmit` passes
@@ -920,6 +981,7 @@ Pass criteria:
 5. Webhook stale-lease reclaim validated
 6. Grace-period downgrade and recovery validated
 7. Catalog sync and unknown-price fallback validated
-8. Production Stripe live IDs/secrets configured separately from test mode
-9. `project-info-docs/stripe-dashboard-setup.md` completed and signed off
-10. Stale customer mapping recovery validated for checkout and portal
+8. Stale-event watermark guard + reconciliation RPC validated (`7.37`, `7.38`)
+9. Production Stripe live IDs/secrets configured separately from test mode
+10. `project-info-docs/stripe-dashboard-setup.md` completed and signed off
+11. Stale customer mapping recovery validated for checkout and portal

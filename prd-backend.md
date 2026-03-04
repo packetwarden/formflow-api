@@ -84,9 +84,10 @@ In 2026, webhooks must be treated as untrusted and highly volatile.
 2. **Payload Guard**: The Worker rejects oversized webhook payloads before parsing/signature work to reduce abuse surface.
 3. **Idempotent Insert**: The event payload is inserted into `stripe_webhook_events`; `event_id` remains the dedupe key.
 4. **Lease-Based Claims**: Event processing uses a DB-backed claim lease (`processor_id`, `claim_expires_at`) so stale `processing` rows can be reclaimed.
-5. **State Sync**: The Worker parses supported events and updates `subscriptions` as source of truth.
-6. **Grace Handling**: Invoice events set/clear `grace_period_end`; status transitions remain sourced from Stripe subscription state.
-7. **Terminal Status Policy**: `unpaid`, `paused`, and `canceled` immediately converge access to implicit free tier via cache refresh (no synthetic free-row insertion).
-8. **Durable Checkout Idempotency**: Checkout request dedupe is persisted in `stripe_checkout_idempotency` to extend safety beyond Stripe's 24-hour idempotency cache.
-9. **Customer Mapping Invariant**: Billing enforces one Stripe customer per workspace via `workspace_billing_customers`.
-10. **Stripe-as-Source Catalog**: Recurring prices are synced from Stripe to `plan_variants`; checkout and webhook fallback force one sync attempt on drift before deterministic failure.
+5. **Authoritative State Sync**: The Worker parses supported events and applies subscription snapshots through a single DB RPC so `subscriptions` remains the only billing source of truth.
+6. **Order-Race Guard**: Subscription rows track Stripe event watermark metadata; stale webhook events are ignored deterministically.
+7. **Grace Handling**: Invoice events set/clear `grace_period_end`; status transitions remain sourced from Stripe subscription state.
+8. **Terminal Status Policy**: `unpaid`, `paused`, and `canceled` converge access to implicit free tier; `workspaces.plan` is a UI cache synchronized by DB trigger.
+9. **Durable Checkout Idempotency**: Checkout request dedupe is persisted in `stripe_checkout_idempotency` to extend safety beyond Stripe's 24-hour idempotency cache.
+10. **Customer Mapping Invariant**: Billing enforces one Stripe customer per workspace via `workspace_billing_customers`.
+11. **Stripe-as-Source Catalog**: Recurring prices are synced from Stripe to `plan_variants`; checkout and webhook fallback force one sync attempt on drift before deterministic failure.

@@ -424,7 +424,7 @@ Additional hardening in `src/routes/f/index.ts`:
    - `{ "error": "Failed to submit form", "code": "RUNNER_INTERNAL_ERROR" }`
 4. `@hono/zod-validator` remains in use for both route param and JSON body validation.
 
-## 8B. Stripe Billing API v3 (Crash-Safe, Drift-Safe, Customer-Recovery-Safe)
+## 8B. Stripe Billing API v4 (Crash-Safe, Drift-Safe, Race-Hardened)
 Stripe router file: `src/routes/stripe/index.ts`
 
 Endpoints:
@@ -480,14 +480,16 @@ Webhook behavior:
    - claim due `pending|failed`
    - reclaim stale `processing` by expired `claim_expires_at` (and legacy `NULL` claim rows)
 7. subscription state sync updates:
-   - `subscriptions` (source of truth)
-   - `workspaces.plan` cache
+   - `subscriptions` (authoritative source of truth)
+   - `workspaces.plan` UI cache via DB trigger-coupled sync
 8. `invoice.payment_failed`, `invoice.payment_action_required`, and `invoice.payment_attempt_required` set `grace_period_end` (no invoice-driven status overwrite)
 9. `invoice.paid` clears `grace_period_end`
-10. `invoice.finalization_failed` syncs from Stripe, then enforces local `status = unpaid` and refreshes workspace plan cache (implicit free convergence; no synthetic free row insert)
-11. `unpaid`, `paused`, `canceled`, and `incomplete_expired` statuses converge workspace access to implicit free via plan-cache refresh only (no free-row insertion)
-12. `incomplete` status is persisted as payment-pending and remains non-entitled (workspace plan stays free until Stripe moves to entitled status)
-13. `customer.subscription.trial_will_end` is processed with subscription sync and structured operational logging (no outbound notifier in current release)
+10. `customer.subscription.*` and `customer.subscription.trial_will_end` paths fetch the latest Stripe subscription snapshot before DB sync
+11. stale-event guard is applied using `subscriptions.last_stripe_event_created_at` watermark fields
+12. `invoice.finalization_failed` syncs from Stripe, then enforces local `status = unpaid`; plan cache convergence is handled by DB trigger/reconcile (no synthetic free row insert)
+13. `unpaid`, `paused`, `canceled`, and `incomplete_expired` statuses converge workspace access to implicit free without synthetic free rows
+14. `incomplete` status is persisted as payment-pending and remains non-entitled (workspace plan cache remains `free` until entitled status)
+15. `customer.subscription.trial_will_end` is processed with subscription sync and structured operational logging (no outbound notifier in current release)
 
 Webhook event coverage:
 1. `checkout.session.completed`
@@ -511,11 +513,11 @@ Scheduled jobs (Worker `scheduled` handler):
    - reclaims stale `processing` rows
 2. grace-period downgrade pass (`0 * * * *`):
    - downgrades expired `past_due` subscriptions to free
-   - refreshes `workspaces.plan`
 3. catalog sync pass (`*/15 * * * *` by default):
    - syncs Stripe recurring prices into active `plan_variants`
 4. webhook cleanup pass (`30 2 * * *`):
    - purges completed webhook rows older than retention window
+   - runs `reconcile_workspace_plan_cache(...)` and logs drift count/sample workspace IDs
 
 ## 9. Validation Catalog
 Validation file: `src/utils/validation.ts`
@@ -599,6 +601,7 @@ Migration source file:
 9. `project-info-docs/migrations/2026-02-27_security_definer_hardening_v2.sql`
 10. `project-info-docs/migrations/2026-03-02_rls_initplan_wrapper_hardening_v1.sql`
 11. `project-info-docs/migrations/2026-03-04_implicit_free_entitlements_v5.sql`
+12. `project-info-docs/migrations/2026-03-04_stripe_plan_cache_consistency_v6.sql`
 
 ## 11. Implementation Files Added or Updated
 Updated:
@@ -627,9 +630,10 @@ Added:
 9. `project-info-docs/migrations/2026-02-27_security_definer_hardening_v2.sql`
 10. `project-info-docs/migrations/2026-03-02_rls_initplan_wrapper_hardening_v1.sql`
 11. `project-info-docs/migrations/2026-03-04_implicit_free_entitlements_v5.sql`
-12. `project-info-docs/stripe-implementation.md`
-13. `runner-api-beta.md`
-14. `test-runner-public-v1.md`
+12. `project-info-docs/migrations/2026-03-04_stripe_plan_cache_consistency_v6.sql`
+13. `project-info-docs/stripe-implementation.md`
+14. `runner-api-beta.md`
+15. `test-runner-public-v1.md`
 
 ## 12. Operational Runbook
 For fresh database setup:
@@ -648,7 +652,8 @@ For existing V1 environments:
 9. execute `project-info-docs/migrations/2026-02-26_stripe_incomplete_status_v4.sql`
 10. execute `project-info-docs/migrations/2026-03-02_rls_initplan_wrapper_hardening_v1.sql`
 11. execute `project-info-docs/migrations/2026-03-04_implicit_free_entitlements_v5.sql`
-12. verify function privileges, search-path hardening, webhook lease reclaim, checkout idempotency, customer-recovery audit behavior, pending-payment status handling, RLS initplan wrapper predicates, and implicit-free entitlement fallback
+12. execute `project-info-docs/migrations/2026-03-04_stripe_plan_cache_consistency_v6.sql`
+13. verify function privileges, search-path hardening, webhook lease reclaim, checkout idempotency, customer-recovery audit behavior, pending-payment status handling, RLS initplan wrapper predicates, implicit-free entitlement fallback, plan-cache trigger sync, stale-event watermark behavior, and reconciliation RPC behavior
 
 Emergency rollback (Stripe v2 -> Stripe v1):
 1. roll back backend code to the last Stripe v1 git revision
@@ -668,8 +673,21 @@ WHERE routine_schema = 'public'
       'check_request',
       'get_published_form_by_id',
       'get_form_submission_quota',
-      'claim_stripe_webhook_event'
+      'claim_stripe_webhook_event',
+      'refresh_workspace_plan_cache',
+      'reconcile_workspace_plan_cache',
+      'apply_stripe_subscription_snapshot'
   );
+
+-- ensure plan-cache sync trigger is present on subscriptions
+SELECT t.tgname
+FROM pg_trigger t
+JOIN pg_class c ON c.oid = t.tgrelid
+JOIN pg_namespace n ON n.oid = c.relnamespace
+WHERE n.nspname = 'public'
+  AND c.relname = 'subscriptions'
+  AND t.tgname = 'sync_workspace_plan_cache_from_subscriptions'
+  AND NOT t.tgisinternal;
 
 -- ensure removed free-row artifacts are absent
 SELECT
