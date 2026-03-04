@@ -9,6 +9,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 ## [Unreleased]
 
 ### Added
+- **Implicit-Free Entitlements Refactor v5**: Added `project-info-docs/migrations/2026-03-04_implicit_free_entitlements_v5.sql` to remove synthetic free-subscription rows, drop free-row trigger/RPC artifacts, and make entitlement resolution fall back to free plan when no entitled subscription exists.
 - **Stripe Webhook Coverage Hardening v4.1**: Expanded webhook handling in `src/routes/stripe/index.ts` for `invoice.payment_action_required` (plus forward-compatible `invoice.payment_attempt_required` alias), `invoice.finalization_failed`, `customer.subscription.paused`, `customer.subscription.resumed`, and `customer.subscription.trial_will_end`; added signature-verified fast-ack behavior for `invoice.created` (`200` without durable queue insert).
 - **RLS InitPlan Wrapper Hardening v1**: Added `project-info-docs/migrations/2026-03-02_rls_initplan_wrapper_hardening_v1.sql`, rewrote workspace helper predicates in RLS policies to `= ANY(ARRAY(SELECT ...))`, and aligned `publish_form(...)` workspace authorization guard to wrapper form for statement-level initplan caching behavior.
 - **RLS Workspace Index Audit**: Validated active schema coverage and kept index footprint unchanged (no redundant `workspace_id` indexes added) because leading B-tree coverage already exists on `workspace_members`, `forms`, and `subscriptions`.
@@ -17,7 +18,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 - **Stripe Status Fidelity v4 Migration**: Added `project-info-docs/migrations/2026-02-26_stripe_incomplete_status_v4.sql` to introduce `incomplete` and `incomplete_expired` enum values with metadata-driven backfill.
 - **Stripe Billing Recovery Hardening v3**: Added stale Stripe customer self-heal and one-time recovery retry for checkout/portal session creation in `src/routes/stripe/index.ts`.
 - **Customer Mapping Audit Trail Table**: Added `workspace_billing_customer_events` via `project-info-docs/migrations/2026-02-26_stripe_customer_mapping_recovery_v3.sql` for `validated|invalidated|recreated|webhook_deleted` tracking.
-- **`customer.deleted` Webhook Handling**: Added event handling path that removes mapping drift, cancels affected subscriptions, ensures free tier, and refreshes workspace plan cache.
+- **`customer.deleted` Webhook Handling**: Added event handling path that removes mapping drift, cancels affected subscriptions, and refreshes workspace plan cache to converge implicit free access when no entitled subscription remains.
 - **Stripe v3 Documentation and Test Coverage**: Updated `project-info-docs/stripe-implementation.md`, `project-info-docs/stripe-dashboard-setup.md`, `dev-docs.md`, and `test-stripe-v1.md` with stale-customer recovery runbook and validation scenarios.
 - **Stripe Billing Hardening v2**: Upgraded `src/routes/stripe/index.ts` with checkout idempotency ledger, lease-based webhook claims, stale-claim recovery, catalog sync, and hardened webhook guards.
 - **Checkout Idempotency Header Contract**: `POST /api/v1/stripe/workspaces/:workspaceId/checkout-session` now requires `Idempotency-Key` UUID with deterministic error codes (`IDEMPOTENCY_KEY_REUSED_WITH_DIFFERENT_PAYLOAD`, `IDEMPOTENCY_KEY_EXPIRED`).
@@ -25,7 +26,6 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 - **Workspace Billing Customer Mapping**: Added `workspace_billing_customers` table model (one Stripe customer per workspace) and route-level usage.
 - **Checkout Idempotency Ledger Table**: Added migration-backed `stripe_checkout_idempotency` table to persist checkout request/session mapping beyond Stripe's 24h idempotency cache.
 - **Webhook Claim-Lease Metadata**: Added `processor_id`, `processing_started_at`, `claim_expires_at`, and `next_attempt_at` queue fields with new claim indexes for replay/recovery.
-- **Race-Safe Free Subscription Function**: Added `ensure_free_subscription_for_workspace(UUID, TEXT)` with workspace advisory lock and `INSERT ... ON CONFLICT DO NOTHING`.
 - **Webhook Claim RPC**: Added `claim_stripe_webhook_event(TEXT, TEXT, INTEGER, INTEGER)` to atomically claim/reclaim webhook jobs.
 - **Stripe v2 Migration**: Added `project-info-docs/migrations/2026-02-25_stripe_billing_hardening_v2.sql`.
 - **Stripe v2 Rollback Migration**: Added `project-info-docs/migrations/2026-02-25_stripe_billing_hardening_v2_rollback_to_v1.sql` for emergency schema downgrade to Stripe v1 contract.
@@ -72,7 +72,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 - **Workspace Customer Resolution Policy**: Checkout and portal now validate mapped Stripe customers on every request and no longer trust stale DB mapping blindly.
 - **Customer Create Idempotency Strategy**: Customer creation idempotency key changed from workspace-static (`customer:v1`) to request-scoped (`customer:v2`) to prevent replay of deleted customer IDs.
 - **Catalog Sync Clarification**: `/api/v1/stripe/catalog/sync` is explicitly catalog-only and does not repair customer mappings.
-- **Stripe Status Policy Alignment**: Entitled status set remains `active|trialing|past_due`; `incomplete` is now preserved as payment-pending/non-entitled, and `incomplete_expired|unpaid|paused|canceled` trigger free-tier ensure.
+- **Stripe Status Policy Alignment**: Entitled status set remains `active|trialing|past_due`; `incomplete` is preserved as payment-pending/non-entitled, and `incomplete_expired|unpaid|paused|canceled` now converge to implicit free access via plan-cache refresh only (no synthetic free-row insertion).
 - **Conflict-Safe Pending-to-Entitled Transition**: Stripe webhook sync now demotes conflicting entitled rows before promoting an existing Stripe-linked pending row to `active|trialing|past_due`, preventing `idx_subscriptions_one_active` violations.
 - **Invoice Event Handling**: `invoice.payment_failed` and `invoice.paid` now mutate `grace_period_end` only and no longer force subscription status in DB.
 - **Checkout Security Envelope**: Stripe internals are no longer returned to clients; checkout/portal errors now return stable app code + `correlation_id`.

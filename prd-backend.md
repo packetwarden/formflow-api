@@ -86,7 +86,7 @@ In 2026, webhooks must be treated as untrusted and highly volatile.
 4. **Lease-Based Claims**: Event processing uses a DB-backed claim lease (`processor_id`, `claim_expires_at`) so stale `processing` rows can be reclaimed.
 5. **State Sync**: The Worker parses supported events and updates `subscriptions` as source of truth.
 6. **Grace Handling**: Invoice events set/clear `grace_period_end`; status transitions remain sourced from Stripe subscription state.
-7. **Terminal Status Policy**: `unpaid`, `paused`, and `canceled` immediately trigger free-tier ensure and cache refresh.
+7. **Terminal Status Policy**: `unpaid`, `paused`, and `canceled` immediately converge access to implicit free tier via cache refresh (no synthetic free-row insertion).
 8. **Durable Checkout Idempotency**: Checkout request dedupe is persisted in `stripe_checkout_idempotency` to extend safety beyond Stripe's 24-hour idempotency cache.
 9. **Customer Mapping Invariant**: Billing enforces one Stripe customer per workspace via `workspace_billing_customers`.
 10. **Stripe-as-Source Catalog**: Recurring prices are synced from Stripe to `plan_variants`; checkout and webhook fallback force one sync attempt on drift before deterministic failure.

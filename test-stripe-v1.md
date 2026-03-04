@@ -376,7 +376,7 @@ stripe trigger customer.subscription.deleted
 
 Expected:
 1. paid subscription status becomes `canceled`
-2. free subscription row exists (if no other paid active row)
+2. no synthetic free subscription row is inserted
 3. `workspaces.plan = 'free'`
 
 Verification SQL:
@@ -431,7 +431,7 @@ Wait for grace cron (`0 * * * *`).
 
 Expected:
 1. target paid row marked `canceled`
-2. free subscription row ensured
+2. no synthetic free subscription row is inserted
 3. `workspaces.plan` becomes `free`
 
 ### 7.17 Checkout Idempotency Replay (same key, same payload, <24h)
@@ -489,25 +489,29 @@ Expected:
 2. `attempts` increments
 3. row converges to `completed` or deterministic `failed` with `next_attempt_at`
 
-### 7.21 Free Subscription Race Safety
-Setup (test environment only):
-1. run these in two SQL sessions at the same time for the same workspace:
+### 7.21 Implicit Free Fallback (No Synthetic Free Rows)
+Setup (test environment):
+1. Use a workspace with no active entitled subscription.
+2. verify no synthetic free rows exist:
 ```sql
-SELECT * FROM public.ensure_free_subscription_for_workspace('<workspace_uuid>', 'race-test');
+SELECT COUNT(*) AS synthetic_free_rows
+FROM public.subscriptions s
+JOIN public.plans p ON p.id = s.plan_id
+WHERE s.workspace_id = '<workspace_uuid>'
+  AND p.slug = 'free'
+  AND s.stripe_subscription_id IS NULL;
 ```
-2. then verify active non-Stripe free rows:
+3. verify entitlement fallback to free plan:
 ```sql
-SELECT workspace_id, COUNT(*) AS non_stripe_entitled_rows
-FROM public.subscriptions
-WHERE workspace_id = '<workspace_uuid>'
-  AND stripe_subscription_id IS NULL
-  AND status IN ('active','trialing','past_due')
-GROUP BY workspace_id;
+SELECT feature_key, is_enabled, limit_value
+FROM public.get_workspace_entitlements('<workspace_uuid>')
+WHERE feature_key IN ('max_forms', 'max_submissions_monthly')
+ORDER BY feature_key;
 ```
 
 Expected:
-1. count is exactly `1`
-2. one call may report `created = true`, the other `created = false`
+1. `synthetic_free_rows = 0`
+2. `get_workspace_entitlements(...)` returns free-tier limits for key features
 
 ### 7.22 Catalog Sync + Drift Recovery
 Flow:
@@ -590,7 +594,7 @@ Expected:
 1. webhook event row reaches `completed`
 2. `workspace_billing_customers` row for that customer is deleted
 3. affected subscriptions for that customer are canceled
-4. free subscription row exists for affected workspace
+4. no synthetic free subscription row is inserted for affected workspace
 5. `workspaces.plan` resolves to `free`
 6. `workspace_billing_customer_events` includes `webhook_deleted`
 
@@ -632,7 +636,7 @@ Flow:
 Expected:
 1. webhook event reaches `completed`
 2. `subscriptions.status` is stored as `incomplete_expired`
-3. free subscription row is ensured and `workspaces.plan = 'free'`
+3. no synthetic free subscription row is inserted and `workspaces.plan = 'free'`
 
 Verification SQL:
 ```sql
@@ -691,7 +695,7 @@ Flow:
 Expected:
 1. webhook row reaches `completed`
 2. latest Stripe-linked subscription row stores `status = 'paused'`
-3. free subscription row exists
+3. no synthetic free subscription row is inserted
 4. `workspaces.plan = 'free'`
 
 Verification SQL:
@@ -746,7 +750,7 @@ Expected:
 2. subscription state remains synchronized
 3. structured log entry exists with `event_id`, `subscription_id`, `workspace_id`, and `trial_end`
 
-### 7.36 `invoice.finalization_failed` Immediate Free-Tier Enforcement
+### 7.36 `invoice.finalization_failed` Immediate Implicit-Free Convergence
 Flow:
 1. Trigger or resend `invoice.finalization_failed` for a paid subscription.
 2. Wait for async processing.
@@ -754,7 +758,7 @@ Flow:
 Expected:
 1. webhook row reaches `completed`
 2. Stripe-linked row is forced to `status = 'unpaid'`
-3. free subscription row is ensured
+3. no synthetic free subscription row is inserted
 4. `workspaces.plan = 'free'`
 5. subscription metadata contains finalization-failure reason and Stripe event linkage
 
@@ -902,7 +906,7 @@ Pass criteria:
 2. Validation and authorization violations return deterministic `4xx` codes.
 3. Webhook rows converge to `completed` after retries.
 4. `workspaces.plan` always matches active paid subscription or `free`.
-5. Free-subscription race checks never produce duplicate non-Stripe entitled rows.
+5. Synthetic free subscription rows are not reintroduced (`plan='free' AND stripe_subscription_id IS NULL` stays `0`).
 6. Pending subscription statuses (`incomplete`, `incomplete_expired`) are persisted without lossy remapping.
 7. `invoice.created` returns immediate `200` via ack-only path.
 8. `invoice.finalization_failed` forces Stripe-linked row to `unpaid` and converges workspace plan to `free`.

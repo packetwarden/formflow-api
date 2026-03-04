@@ -240,7 +240,7 @@ const mapStripeSubscriptionStatus = (status: Stripe.Subscription.Status): Mapped
     }
 }
 
-const shouldEnsureFreeSubscription = (status: MappedSubscriptionStatus) =>
+const shouldConvergeImplicitFreeAccess = (status: MappedSubscriptionStatus) =>
     (NON_ENTITLED_TERMINAL_STATUSES as readonly string[]).includes(status)
 
 const isEntitledSubscriptionStatus = (
@@ -426,28 +426,6 @@ const refreshWorkspacePlanCache = async (env: Env, workspaceId: string) => {
         .eq('id', workspaceId)
 
     if (workspaceError) throw new Error(`Failed to update workspace plan cache: ${workspaceError.message}`)
-}
-
-const ensureFreeSubscriptionForWorkspace = async (
-    env: Env,
-    workspaceId: string,
-    source: string
-) => {
-    const supabase = getServiceSupabase(env)
-    const { data, error } = await supabase.rpc('ensure_free_subscription_for_workspace', {
-        p_workspace_id: workspaceId,
-        p_source: source,
-    })
-
-    if (error) throw new Error(`Failed to ensure free subscription: ${error.message}`)
-    const result = Array.isArray(data) ? data[0] : data
-    logStripe('info', 'Ensured free subscription row', {
-        workspace_id: workspaceId,
-        source,
-        created: result?.created ?? null,
-        subscription_id: result?.subscription_id ?? null,
-    })
-    return result
 }
 
 const findEntitledPaidSubscription = async (env: Env, workspaceId: string) => {
@@ -1243,8 +1221,12 @@ const syncSubscriptionFromStripe = async (
     if (!workspaceId) throw new Error(`Unable to resolve workspace for Stripe subscription "${subscription.id}"`)
 
     const mappedStatus = await upsertWorkspaceSubscriptionState(env, workspaceId, subscription)
-    if (shouldEnsureFreeSubscription(mappedStatus)) {
-        await ensureFreeSubscriptionForWorkspace(env, workspaceId, 'stripe-terminal-status')
+    if (shouldConvergeImplicitFreeAccess(mappedStatus)) {
+        logStripe('info', 'Converging workspace to implicit free access for non-entitled terminal status', {
+            workspace_id: workspaceId,
+            subscription_id: subscription.id,
+            mapped_status: mappedStatus,
+        })
     }
     await refreshWorkspacePlanCache(env, workspaceId)
     return workspaceId
@@ -1299,7 +1281,7 @@ const syncSubscriptionFromInvoice = async (
     }
 }
 
-const enforceUnpaidStatusAndFreeTier = async (
+const enforceUnpaidStatusAndImplicitFreeAccess = async (
     env: Env,
     stripeSubscriptionId: string,
     stripeEventId: string,
@@ -1349,7 +1331,12 @@ const enforceUnpaidStatusAndFreeTier = async (
         throw new Error(`Failed to enforce unpaid status after invoice finalization failure: ${updateError.message}`)
     }
 
-    await ensureFreeSubscriptionForWorkspace(env, row.workspace_id, 'invoice-finalization-failed')
+    logStripe('info', 'Converging workspace to implicit free access after invoice finalization failure', {
+        workspace_id: row.workspace_id,
+        stripe_subscription_id: stripeSubscriptionId,
+        stripe_event_id: stripeEventId,
+        stripe_event_type: stripeEventType,
+    })
     await refreshWorkspacePlanCache(env, row.workspace_id)
     return row.workspace_id
 }
@@ -1453,7 +1440,11 @@ const handleDeletedStripeCustomer = async (
             stripeEventId
         )
 
-        await ensureFreeSubscriptionForWorkspace(env, workspaceId, 'stripe-customer-deleted-webhook')
+        logStripe('info', 'Converging workspace to implicit free access after Stripe customer deletion', {
+            workspace_id: workspaceId,
+            stripe_customer_id: customerId,
+            stripe_event_id: stripeEventId,
+        })
         await refreshWorkspacePlanCache(env, workspaceId)
     }
 }
@@ -1538,13 +1529,13 @@ const processStripeEvent = async (env: Env, event: Stripe.Event) => {
             return
         }
 
-        const enforcedWorkspaceId = await enforceUnpaidStatusAndFreeTier(
+        const enforcedWorkspaceId = await enforceUnpaidStatusAndImplicitFreeAccess(
             env,
             synced.subscriptionId,
             event.id,
             eventType
         )
-        logStripe('warn', 'Stripe invoice finalization failed; enforced unpaid status and free-tier access', {
+        logStripe('warn', 'Stripe invoice finalization failed; enforced unpaid status and converged implicit free access', {
             event_id: event.id,
             event_type: eventType,
             invoice_id: invoice.id,
@@ -1714,10 +1705,13 @@ const enforceGracePeriodDowngrades = async (env: Env) => {
         }
 
         try {
-            await ensureFreeSubscriptionForWorkspace(env, row.workspace_id, 'grace-period-expired')
+            logStripe('info', 'Converging workspace to implicit free access after grace period expiry', {
+                workspace_id: row.workspace_id,
+                subscription_id: row.id,
+            })
             await refreshWorkspacePlanCache(env, row.workspace_id)
         } catch (downgradeError) {
-            logStripe('error', 'Failed to ensure free subscription after grace expiry', {
+            logStripe('error', 'Failed to converge workspace to implicit free access after grace expiry', {
                 workspace_id: row.workspace_id,
                 error: truncateError(downgradeError),
             })

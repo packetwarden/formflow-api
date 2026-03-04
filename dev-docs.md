@@ -484,8 +484,8 @@ Webhook behavior:
    - `workspaces.plan` cache
 8. `invoice.payment_failed`, `invoice.payment_action_required`, and `invoice.payment_attempt_required` set `grace_period_end` (no invoice-driven status overwrite)
 9. `invoice.paid` clears `grace_period_end`
-10. `invoice.finalization_failed` syncs from Stripe, then enforces local `status = unpaid`, ensures free-tier subscription, and refreshes workspace plan cache
-11. `unpaid`, `paused`, `canceled`, and `incomplete_expired` statuses immediately ensure free-tier subscription
+10. `invoice.finalization_failed` syncs from Stripe, then enforces local `status = unpaid` and refreshes workspace plan cache (implicit free convergence; no synthetic free row insert)
+11. `unpaid`, `paused`, `canceled`, and `incomplete_expired` statuses converge workspace access to implicit free via plan-cache refresh only (no free-row insertion)
 12. `incomplete` status is persisted as payment-pending and remains non-entitled (workspace plan stays free until Stripe moves to entitled status)
 13. `customer.subscription.trial_will_end` is processed with subscription sync and structured operational logging (no outbound notifier in current release)
 
@@ -598,6 +598,7 @@ Migration source file:
 8. `project-info-docs/migrations/2026-02-27_runner_submission_gateway_hardening_v1.sql`
 9. `project-info-docs/migrations/2026-02-27_security_definer_hardening_v2.sql`
 10. `project-info-docs/migrations/2026-03-02_rls_initplan_wrapper_hardening_v1.sql`
+11. `project-info-docs/migrations/2026-03-04_implicit_free_entitlements_v5.sql`
 
 ## 11. Implementation Files Added or Updated
 Updated:
@@ -625,9 +626,10 @@ Added:
 8. `project-info-docs/migrations/2026-02-27_runner_submission_gateway_hardening_v1.sql`
 9. `project-info-docs/migrations/2026-02-27_security_definer_hardening_v2.sql`
 10. `project-info-docs/migrations/2026-03-02_rls_initplan_wrapper_hardening_v1.sql`
-11. `project-info-docs/stripe-implementation.md`
-12. `runner-api-beta.md`
-13. `test-runner-public-v1.md`
+11. `project-info-docs/migrations/2026-03-04_implicit_free_entitlements_v5.sql`
+12. `project-info-docs/stripe-implementation.md`
+13. `runner-api-beta.md`
+14. `test-runner-public-v1.md`
 
 ## 12. Operational Runbook
 For fresh database setup:
@@ -645,7 +647,8 @@ For existing V1 environments:
 8. execute `project-info-docs/migrations/2026-02-26_stripe_customer_mapping_recovery_v3.sql`
 9. execute `project-info-docs/migrations/2026-02-26_stripe_incomplete_status_v4.sql`
 10. execute `project-info-docs/migrations/2026-03-02_rls_initplan_wrapper_hardening_v1.sql`
-11. verify function privileges, search-path hardening, webhook lease reclaim, checkout idempotency, customer-recovery audit behavior, pending-payment status handling, and RLS initplan wrapper predicates
+11. execute `project-info-docs/migrations/2026-03-04_implicit_free_entitlements_v5.sql`
+12. verify function privileges, search-path hardening, webhook lease reclaim, checkout idempotency, customer-recovery audit behavior, pending-payment status handling, RLS initplan wrapper predicates, and implicit-free entitlement fallback
 
 Emergency rollback (Stripe v2 -> Stripe v1):
 1. roll back backend code to the last Stripe v1 git revision
@@ -665,9 +668,29 @@ WHERE routine_schema = 'public'
       'check_request',
       'get_published_form_by_id',
       'get_form_submission_quota',
-       'ensure_free_subscription_for_workspace',
-       'claim_stripe_webhook_event'
+      'claim_stripe_webhook_event'
   );
+
+-- ensure removed free-row artifacts are absent
+SELECT
+  to_regprocedure('public.ensure_free_subscription_for_workspace(uuid,text)') AS ensure_free_rpc,
+  to_regprocedure('public.handle_new_workspace_subscription()') AS workspace_trigger_fn;
+
+SELECT t.tgname
+FROM pg_trigger t
+JOIN pg_class c ON c.oid = t.tgrelid
+JOIN pg_namespace n ON n.oid = c.relnamespace
+WHERE n.nspname = 'public'
+  AND c.relname = 'workspaces'
+  AND t.tgname = 'on_workspace_created_subscription'
+  AND NOT t.tgisinternal;
+
+-- ensure no synthetic free subscription rows remain
+SELECT COUNT(*) AS synthetic_free_rows
+FROM public.subscriptions s
+JOIN public.plans p ON p.id = s.plan_id
+WHERE p.slug = 'free'
+  AND s.stripe_subscription_id IS NULL;
 
 -- ensure no touched policy still contains raw helper form:
 --   IN (SELECT private.user_*_workspace_ids())
