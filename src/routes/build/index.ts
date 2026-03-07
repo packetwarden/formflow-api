@@ -11,6 +11,8 @@ import {
 } from '../../utils/workspace-access'
 import {
     buildParamSchema,
+    buildSubmissionListQuerySchema,
+    buildSubmissionParamSchema,
     createFormSchema,
     publishFormSchema,
     updateDraftSchema,
@@ -25,6 +27,11 @@ type EntitlementRow = {
     feature_key: string
     is_enabled: boolean
     limit_value: number | null
+}
+
+type SubmissionListRow = Record<string, unknown> & {
+    id: string
+    created_at: string
 }
 
 const formSummarySelect = [
@@ -46,6 +53,30 @@ const formSummarySelect = [
 ].join(', ')
 
 const formDetailSelect = `${formSummarySelect}, schema`
+
+const submissionListSelect = [
+    'id',
+    'form_id',
+    'form_version_id',
+    'status',
+    'data',
+    'respondent_id',
+    'started_at',
+    'completed_at',
+    'completion_time_ms',
+    'created_at',
+    'updated_at',
+].join(', ')
+
+const submissionDetailSelect = [
+    submissionListSelect,
+    'ip_address',
+    'user_agent',
+    'referrer',
+    'geo_country',
+    'geo_city',
+    'spam_score',
+].join(', ')
 
 buildRouter.use('*', requireAuth)
 buildRouter.use('*', buildWriteRateLimit)
@@ -88,6 +119,29 @@ const buildSlugWithSuffix = (baseSlug: string, suffix: string) => {
 }
 
 const randomSlugSuffix = () => crypto.randomUUID().replace(/-/g, '').slice(0, 6)
+
+const ensureVisibleForm = async (c: BuildContext, workspaceId: string, formId: string) => {
+    const supabase = getScopedSupabaseClient(c)
+
+    const { data: form, error } = await supabase
+        .from('forms')
+        .select('id')
+        .eq('id', formId)
+        .eq('workspace_id', workspaceId)
+        .is('deleted_at', null)
+        .maybeSingle()
+
+    if (error) {
+        console.error('Build form visibility check error:', error)
+        return { ok: false as const, response: c.json({ error: 'Failed to validate form access' }, 500) }
+    }
+
+    if (!form) {
+        return { ok: false as const, response: c.json({ error: 'Form not found' }, 404) }
+    }
+
+    return { ok: true as const }
+}
 
 const checkCreateFormEntitlement = async (c: BuildContext, workspaceId: string) => {
     const supabase = getScopedSupabaseClient(c)
@@ -281,6 +335,102 @@ buildRouter.get(
         }
 
         return c.json({ form }, 200)
+    }
+)
+
+/**
+ * GET /api/v1/build/:workspaceId/forms/:formId/submissions
+ * Returns a bounded page of submissions for a single form.
+ */
+buildRouter.get(
+    '/:workspaceId/forms/:formId/submissions',
+    zValidator('param', buildParamSchema),
+    zValidator('query', buildSubmissionListQuerySchema),
+    async (c) => {
+        const { workspaceId, formId } = c.req.valid('param')
+        const { limit, cursor_created_at, cursor_submission_id } = c.req.valid('query')
+
+        const access = await checkWorkspaceAccess(c, workspaceId)
+        if (!access.ok) return access.response
+
+        const formAccess = await ensureVisibleForm(c, workspaceId, formId)
+        if (!formAccess.ok) return formAccess.response
+
+        const supabase = getScopedSupabaseClient(c)
+        let query = supabase
+            .from('form_submissions')
+            .select(submissionListSelect)
+            .eq('form_id', formId)
+            .is('deleted_at', null)
+            .order('created_at', { ascending: false })
+            .order('id', { ascending: false })
+            .limit(limit + 1)
+
+        if (cursor_created_at && cursor_submission_id) {
+            query = query.or(
+                `created_at.lt.${cursor_created_at},and(created_at.eq.${cursor_created_at},id.lt.${cursor_submission_id})`
+            )
+        }
+
+        const { data: submissions, error } = await query
+
+        if (error) {
+            console.error('Build form submissions list error:', error)
+            return c.json({ error: 'Failed to fetch form submissions' }, 500)
+        }
+
+        const page = (submissions ?? []) as unknown as SubmissionListRow[]
+        const hasMore = page.length > limit
+        const boundedPage = hasMore ? page.slice(0, limit) : page
+        const lastSubmission = boundedPage[boundedPage.length - 1]
+
+        return c.json({
+            submissions: boundedPage,
+            next_cursor: hasMore && lastSubmission
+                ? {
+                    created_at: lastSubmission.created_at,
+                    submission_id: lastSubmission.id,
+                }
+                : null,
+        }, 200)
+    }
+)
+
+/**
+ * GET /api/v1/build/:workspaceId/forms/:formId/submissions/:submissionId
+ * Returns one submission for a single form without exposing internal idempotency fields.
+ */
+buildRouter.get(
+    '/:workspaceId/forms/:formId/submissions/:submissionId',
+    zValidator('param', buildSubmissionParamSchema),
+    async (c) => {
+        const { workspaceId, formId, submissionId } = c.req.valid('param')
+
+        const access = await checkWorkspaceAccess(c, workspaceId)
+        if (!access.ok) return access.response
+
+        const formAccess = await ensureVisibleForm(c, workspaceId, formId)
+        if (!formAccess.ok) return formAccess.response
+
+        const supabase = getScopedSupabaseClient(c)
+        const { data: submission, error } = await supabase
+            .from('form_submissions')
+            .select(submissionDetailSelect)
+            .eq('id', submissionId)
+            .eq('form_id', formId)
+            .is('deleted_at', null)
+            .maybeSingle()
+
+        if (error) {
+            console.error('Build form submission fetch error:', error)
+            return c.json({ error: 'Failed to fetch form submission' }, 500)
+        }
+
+        if (!submission) {
+            return c.json({ error: 'Submission not found' }, 404)
+        }
+
+        return c.json({ submission }, 200)
     }
 )
 

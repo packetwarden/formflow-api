@@ -44,6 +44,8 @@ We utilize a RESTful design optimized through Hono's `app.route()` grouping feat
 | **Builder Group (`/api/v1/build/:workspaceId/*`)** |  |  |  |
 | **GET** | `/api/v1/build/:workspaceId/forms` | Fetch all forms belonging to the workspace. | Yes (Bearer) |
 | **GET** | `/api/v1/build/:workspaceId/forms/:formId` | Fetch the draft `schema` JSONB for the editor. | Yes (Bearer) |
+| **GET** | `/api/v1/build/:workspaceId/forms/:formId/submissions` | List submissions for one form with bounded pagination. | Yes (Bearer) |
+| **GET** | `/api/v1/build/:workspaceId/forms/:formId/submissions/:submissionId` | Fetch a single submission for admin review. | Yes (Bearer) |
 | **PUT** | `/api/v1/build/:workspaceId/forms/:formId` | Save updates to the draft `schema` JSONB. | Yes (Bearer) |
 | **POST** | `/api/v1/build/:workspaceId/forms/:formId/publish` | Trigger the `publish_form()` RPC to lock a new version. | Yes (Bearer) |
 | **Public Runner Group (`/api/v1/f/*`)** |  |  |  |

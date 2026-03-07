@@ -19,7 +19,12 @@ export const formParamSchema = z.object({
     formId: z.string().uuid('formId must be a valid UUID'),
 });
 
+export const submissionParamSchema = z.object({
+    submissionId: z.string().uuid('submissionId must be a valid UUID'),
+});
+
 export const buildParamSchema = workspaceParamSchema.merge(formParamSchema);
+export const buildSubmissionParamSchema = buildParamSchema.merge(submissionParamSchema);
 export const runnerFormParamSchema = formParamSchema;
 
 const stripePlanSlugSchema = z.enum(['free', 'pro', 'business', 'enterprise']);
@@ -62,6 +67,34 @@ export const updateDraftSchema = z.object({
 export const publishFormSchema = z.object({
     description: z.string().trim().max(500, 'description must be at most 500 characters').optional(),
 });
+
+export const buildSubmissionListQuerySchema = z.object({
+    limit: z
+        .coerce
+        .number()
+        .int('limit must be an integer')
+        .min(1, 'limit must be between 1 and 100')
+        .max(100, 'limit must be between 1 and 100')
+        .default(25),
+    cursor_created_at: z
+        .string()
+        .datetime({ offset: true, message: 'cursor_created_at must be a valid ISO datetime string with offset' })
+        .optional(),
+    cursor_submission_id: z
+        .string()
+        .uuid('cursor_submission_id must be a valid UUID')
+        .optional(),
+})
+    .strict()
+    .refine(
+        (value) =>
+            (!value.cursor_created_at && !value.cursor_submission_id) ||
+            (value.cursor_created_at !== undefined && value.cursor_submission_id !== undefined),
+        {
+            message: 'cursor_created_at and cursor_submission_id must be provided together',
+            path: ['cursor_created_at'],
+        }
+    );
 
 const formTitleSchema = z
     .string()
@@ -125,6 +158,7 @@ export type UpdateDraftInput = z.infer<typeof updateDraftSchema>;
 export type PublishFormInput = z.infer<typeof publishFormSchema>;
 export type CreateFormInput = z.infer<typeof createFormSchema>;
 export type UpdateFormMetaInput = z.infer<typeof updateFormMetaSchema>;
+export type BuildSubmissionListQueryInput = z.infer<typeof buildSubmissionListQuerySchema>;
 export type RunnerSubmitBodyInput = z.infer<typeof runnerSubmitBodySchema>;
 export type RunnerIdempotencyHeaderInput = z.infer<typeof runnerIdempotencyHeaderSchema>;
 export type StripeCheckoutSessionInput = z.infer<typeof stripeCheckoutSessionSchema>;

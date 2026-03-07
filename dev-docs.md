@@ -120,6 +120,7 @@ Global behavior:
    - delete: admin-level (`owner`, `admin`)
 5. optimistic locking enforced on mutable form updates (`PATCH` metadata and `PUT` schema)
 6. create-form path enforces `max_forms` entitlement via `get_workspace_entitlements`
+7. submission read endpoints use bounded keyset pagination on (`created_at`, `id`) to avoid unbounded admin reads and timestamp-tie skips
 
 ### 8.1 GET `/api/v1/build/:workspaceId/forms`
 Purpose: list workspace forms for builder dashboard.
@@ -309,6 +310,86 @@ Status mapping:
 2. `403` insufficient role
 3. `404` form not found/already deleted
 4. `500` delete failure
+
+### 8.8 GET `/api/v1/build/:workspaceId/forms/:formId/submissions`
+Purpose: list submissions for a single form in builder/admin surfaces.
+
+Validation:
+1. `workspaceId` UUID
+2. `formId` UUID
+3. query schema (`buildSubmissionListQuerySchema`):
+   - `limit` integer `1..100`, default `25`
+   - `cursor_created_at?` ISO datetime string with timezone offset
+   - `cursor_submission_id?` UUID
+   - both cursor fields must be provided together
+
+Data flow:
+1. check workspace visibility (`workspaces.id`, `deleted_at IS NULL`)
+2. pre-check form visibility in workspace (`forms.id`, `workspace_id`, `deleted_at IS NULL`)
+3. query `form_submissions` by `form_id`
+4. exclude soft-deleted submissions (`deleted_at IS NULL`)
+5. order by `created_at DESC`, then `id DESC`
+6. if cursor fields are present, apply keyset filter:
+   - `created_at < cursor_created_at`
+   - OR `created_at = cursor_created_at AND id < cursor_submission_id`
+7. request `limit + 1` rows to determine whether another page exists
+
+Selected fields:
+1. `id`
+2. `form_id`
+3. `form_version_id`
+4. `status`
+5. `data`
+6. `respondent_id`
+7. `started_at`
+8. `completed_at`
+9. `completion_time_ms`
+10. `created_at`
+11. `updated_at`
+
+Response contract:
+1. `{ submissions: Submission[], next_cursor: { created_at, submission_id } | null }`
+2. `next_cursor` is derived from the last returned row when more rows are available
+
+Security notes:
+1. access follows existing RLS policy `Members can view submissions`
+2. route does not expose `idempotency_key`, `encrypted_pii`, or `deleted_at`
+
+Status mapping:
+1. `200` success
+2. `404` workspace/form not visible or not found
+3. `500` query failures
+
+### 8.9 GET `/api/v1/build/:workspaceId/forms/:formId/submissions/:submissionId`
+Purpose: fetch one submission with responder/network metadata for admin review.
+
+Validation:
+1. `workspaceId` UUID
+2. `formId` UUID
+3. `submissionId` UUID
+
+Data flow:
+1. check workspace visibility
+2. pre-check form visibility
+3. query `form_submissions` by `id` + `form_id`
+4. exclude soft-deleted rows (`deleted_at IS NULL`)
+
+Selected fields:
+1. all list fields above
+2. `ip_address`
+3. `user_agent`
+4. `referrer`
+5. `geo_country`
+6. `geo_city`
+7. `spam_score`
+
+Security notes:
+1. route intentionally omits `idempotency_key`, `encrypted_pii`, and `deleted_at`
+
+Status mapping:
+1. `200` success
+2. `404` workspace/form/submission not visible or not found
+3. `500` query failures
 
 ## 8A. Runner API v1 (Beta-Complete)
 Runner router file: `src/routes/f/index.ts`
@@ -548,6 +629,20 @@ Stripe schemas:
 ## 10. Database Contract Updates in V2
 Schema file: `project-info-docs/formflow_beta_schema_v2.sql`
 
+Canonical launch baseline status:
+1. V2 now includes the fresh-install launch contract through `2026-03-06_function_search_path_hardening_v3.sql`.
+2. Fresh installs from V2 already include:
+   - `workspace_billing_customers`
+   - `workspace_billing_customer_events`
+   - `stripe_checkout_idempotency`
+   - `claim_stripe_webhook_event(...)`
+   - `refresh_workspace_plan_cache(...)`
+   - `reconcile_workspace_plan_cache(...)`
+   - `apply_stripe_subscription_snapshot(...)`
+   - webhook lease columns on `stripe_webhook_events`
+   - Stripe event watermark columns on `subscriptions`
+3. Post-V2 migration files remain the incremental upgrade path for already-provisioned environments.
+
 `publish_form` changes merged into V2:
 1. fixed settings source:
    - old: `SELECT schema, settings FROM public.forms` (invalid in beta schema)
@@ -589,7 +684,24 @@ RLS initplan wrapper hardening in V2:
 3. no new `workspace_id` indexes were added in this hardening pass:
    - active schema already has leading `workspace_id` B-tree coverage for RLS paths (`workspace_members`, `forms`, `subscriptions`)
 
-Migration source file:
+Least-privilege grants hardening v1 in V2:
+1. removed broad table-level grants to `authenticated` on:
+   - `profiles`, `workspaces`, `workspace_members`, `forms`, `form_versions`, `form_submissions`
+2. removed direct `anon` table grants on core builder tables:
+   - `profiles`, `workspaces`, `workspace_members`, `forms`, `form_versions`, `form_submissions`
+3. direct authenticated writes are now limited to `public.forms` with column-level grants:
+   - `INSERT`: `workspace_id`, `title`, `slug`, `description`, `schema`, `max_submissions`, `accept_submissions`, `success_message`, `redirect_url`
+   - `UPDATE`: `title`, `description`, `schema`, `max_submissions`, `accept_submissions`, `success_message`, `redirect_url`, `version`, `status`, `deleted_at`
+4. direct hard-delete grant paths removed from soft-delete tables for `authenticated`:
+   - `profiles`, `workspaces`, `forms`, `form_submissions`
+
+Function search-path hardening v3 in V2:
+1. pinned `SET search_path = ''` on trigger helper functions:
+   - `public.set_updated_at()`
+   - `public.cascade_soft_delete()`
+2. resolves Security Advisor "Function Search Path Mutable" findings for these functions
+
+Migration sources now folded into canonical V2 baseline:
 1. `project-info-docs/migrations/2026-02-23_fix_publish_form.sql`
 2. `project-info-docs/migrations/2026-02-23_runner_public_api_v1.sql`
 3. `project-info-docs/migrations/2026-02-24_runner_strict_submit_rate_limit.sql`
@@ -602,6 +714,8 @@ Migration source file:
 10. `project-info-docs/migrations/2026-03-02_rls_initplan_wrapper_hardening_v1.sql`
 11. `project-info-docs/migrations/2026-03-04_implicit_free_entitlements_v5.sql`
 12. `project-info-docs/migrations/2026-03-04_stripe_plan_cache_consistency_v6.sql`
+13. `project-info-docs/migrations/2026-03-05_grants_least_privilege_hardening_v1.sql`
+14. `project-info-docs/migrations/2026-03-06_function_search_path_hardening_v3.sql`
 
 ## 11. Implementation Files Added or Updated
 Updated:
@@ -631,14 +745,17 @@ Added:
 10. `project-info-docs/migrations/2026-03-02_rls_initplan_wrapper_hardening_v1.sql`
 11. `project-info-docs/migrations/2026-03-04_implicit_free_entitlements_v5.sql`
 12. `project-info-docs/migrations/2026-03-04_stripe_plan_cache_consistency_v6.sql`
-13. `project-info-docs/stripe-implementation.md`
-14. `runner-api-beta.md`
-15. `test-runner-public-v1.md`
+13. `project-info-docs/migrations/2026-03-05_grants_least_privilege_hardening_v1.sql`
+14. `project-info-docs/migrations/2026-03-06_function_search_path_hardening_v3.sql`
+15. `project-info-docs/stripe-implementation.md`
+16. `runner-api-beta.md`
+17. `test-runner-public-v1.md`
 
 ## 12. Operational Runbook
 For fresh database setup:
 1. execute `project-info-docs/formflow_beta_schema_v2.sql`
-2. do not bootstrap from V1
+2. no follow-up migrations are required for the current launch contract
+3. do not bootstrap from V1
 
 For existing V1 environments:
 1. execute `project-info-docs/migrations/2026-02-23_fix_publish_form.sql`
@@ -653,7 +770,9 @@ For existing V1 environments:
 10. execute `project-info-docs/migrations/2026-03-02_rls_initplan_wrapper_hardening_v1.sql`
 11. execute `project-info-docs/migrations/2026-03-04_implicit_free_entitlements_v5.sql`
 12. execute `project-info-docs/migrations/2026-03-04_stripe_plan_cache_consistency_v6.sql`
-13. verify function privileges, search-path hardening, webhook lease reclaim, checkout idempotency, customer-recovery audit behavior, pending-payment status handling, RLS initplan wrapper predicates, implicit-free entitlement fallback, plan-cache trigger sync, stale-event watermark behavior, and reconciliation RPC behavior
+13. execute `project-info-docs/migrations/2026-03-05_grants_least_privilege_hardening_v1.sql`
+14. execute `project-info-docs/migrations/2026-03-06_function_search_path_hardening_v3.sql`
+15. verify function privileges, table/column grants hardening, search-path hardening, webhook lease reclaim, checkout idempotency, customer-recovery audit behavior, pending-payment status handling, RLS initplan wrapper predicates, implicit-free entitlement fallback, plan-cache trigger sync, stale-event watermark behavior, and reconciliation RPC behavior
 
 Emergency rollback (Stripe v2 -> Stripe v1):
 1. roll back backend code to the last Stripe v1 git revision
@@ -677,6 +796,128 @@ WHERE routine_schema = 'public'
       'refresh_workspace_plan_cache',
       'reconcile_workspace_plan_cache',
       'apply_stripe_subscription_snapshot'
+  );
+
+-- ensure launch-only Stripe tables exist
+SELECT table_name
+FROM information_schema.tables
+WHERE table_schema = 'public'
+  AND table_name IN (
+      'workspace_billing_customers',
+      'workspace_billing_customer_events',
+      'stripe_checkout_idempotency',
+      'stripe_webhook_events'
+  )
+ORDER BY table_name;
+
+-- ensure webhook lease and Stripe watermark columns are present
+SELECT table_name, column_name
+FROM information_schema.columns
+WHERE table_schema = 'public'
+  AND (
+      (table_name = 'stripe_webhook_events' AND column_name IN (
+          'processor_id',
+          'processing_started_at',
+          'claim_expires_at',
+          'next_attempt_at'
+      ))
+      OR (table_name = 'subscriptions' AND column_name IN (
+          'last_stripe_event_id',
+          'last_stripe_event_type',
+          'last_stripe_event_created_at'
+      ))
+  )
+ORDER BY table_name, column_name;
+
+-- verify trigger helper functions pin search_path
+SELECT
+  n.nspname AS schema_name,
+  p.proname AS function_name,
+  p.proconfig
+FROM pg_proc p
+JOIN pg_namespace n ON n.oid = p.pronamespace
+WHERE n.nspname = 'public'
+  AND p.proname IN ('set_updated_at', 'cascade_soft_delete');
+
+-- verify service-role-only RPC grants
+SELECT routine_name, grantee, privilege_type
+FROM information_schema.role_routine_grants
+WHERE routine_schema = 'public'
+  AND routine_name IN (
+      'claim_stripe_webhook_event',
+      'refresh_workspace_plan_cache',
+      'reconcile_workspace_plan_cache',
+      'apply_stripe_subscription_snapshot'
+  )
+ORDER BY routine_name, grantee, privilege_type;
+
+-- verify least-privilege table grants for authenticated on core builder tables
+SELECT
+  table_name,
+  string_agg(privilege_type, ', ' ORDER BY privilege_type) AS table_privileges
+FROM information_schema.role_table_grants
+WHERE table_schema = 'public'
+  AND grantee = 'authenticated'
+  AND table_name IN (
+      'profiles',
+      'workspaces',
+      'workspace_members',
+      'forms',
+      'form_versions',
+      'form_submissions'
+  )
+GROUP BY table_name
+ORDER BY table_name;
+
+-- verify anon has no direct table privileges on core builder tables
+SELECT table_name, privilege_type
+FROM information_schema.role_table_grants
+WHERE table_schema = 'public'
+  AND grantee = 'anon'
+  AND table_name IN (
+      'profiles',
+      'workspaces',
+      'workspace_members',
+      'forms',
+      'form_versions',
+      'form_submissions'
+  );
+
+-- verify no direct DELETE grants remain on soft-delete tables
+SELECT table_name, privilege_type
+FROM information_schema.role_table_grants
+WHERE table_schema = 'public'
+  AND grantee = 'authenticated'
+  AND privilege_type = 'DELETE'
+  AND table_name IN ('profiles', 'workspaces', 'forms', 'form_submissions');
+
+-- verify forms has no table-level UPDATE grant for authenticated
+SELECT table_name, privilege_type
+FROM information_schema.role_table_grants
+WHERE table_schema = 'public'
+  AND grantee = 'authenticated'
+  AND table_name = 'forms'
+  AND privilege_type = 'UPDATE';
+
+-- verify forms column-level INSERT/UPDATE grant set for authenticated
+SELECT privilege_type, column_name
+FROM information_schema.column_privileges
+WHERE table_schema = 'public'
+  AND table_name = 'forms'
+  AND grantee = 'authenticated'
+  AND privilege_type IN ('INSERT', 'UPDATE')
+ORDER BY privilege_type, column_name;
+
+-- verify no direct anon/authenticated grants exist on service-role-only Stripe tables
+SELECT grantee, table_name, privilege_type
+FROM information_schema.role_table_grants
+WHERE table_schema = 'public'
+  AND grantee IN ('anon', 'authenticated')
+  AND table_name IN (
+      'workspace_billing_customers',
+      'workspace_billing_customer_events',
+      'stripe_checkout_idempotency',
+      'stripe_webhook_events'
   );
 
 -- ensure plan-cache sync trigger is present on subscriptions
@@ -709,6 +950,9 @@ FROM public.subscriptions s
 JOIN public.plans p ON p.id = s.plan_id
 WHERE p.slug = 'free'
   AND s.stripe_subscription_id IS NULL;
+
+-- ensure removed non-Stripe entitled uniqueness index is absent
+SELECT to_regclass('public.idx_subscriptions_one_non_stripe_entitled') AS removed_non_stripe_index;
 
 -- ensure no touched policy still contains raw helper form:
 --   IN (SELECT private.user_*_workspace_ids())
