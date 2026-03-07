@@ -99,14 +99,14 @@ pm.test("Status is not 401", function () {
 | GET | `/api/v1/auth/me` | Yes | `200` |
 | POST | `/api/v1/auth/logout` | Yes | `200` |
 | GET | `/api/v1/build/:workspaceId/forms` | Yes | `200` / `404` |
-| POST | `/api/v1/build/:workspaceId/forms` | Yes | `201` / `403` / `404` |
+| POST | `/api/v1/build/:workspaceId/forms` | Yes | `201` / `403` / `404` / `422` |
 | GET | `/api/v1/build/:workspaceId/forms/:formId` | Yes | `200` / `404` |
 | PATCH | `/api/v1/build/:workspaceId/forms/:formId` | Yes | `200` / `403` / `404` / `409` |
-| PUT | `/api/v1/build/:workspaceId/forms/:formId` | Yes | `200` / `403` / `404` / `409` |
-| POST | `/api/v1/build/:workspaceId/forms/:formId/publish` | Yes | `200` / `403` / `404` |
+| PUT | `/api/v1/build/:workspaceId/forms/:formId` | Yes | `200` / `403` / `404` / `409` / `422` |
+| POST | `/api/v1/build/:workspaceId/forms/:formId/publish` | Yes | `200` / `403` / `404` / `422` |
 | DELETE | `/api/v1/build/:workspaceId/forms/:formId` | Yes | `200` / `403` / `404` |
 | GET | `/api/v1/f/:formId/schema` | No | `200` / `400` / `404` |
-| POST | `/api/v1/f/:formId/submit` | No (`Idempotency-Key` required) | `200` / `400` / `404` / `409` / `429` |
+| POST | `/api/v1/f/:formId/submit` | No (`Idempotency-Key` required) | `201` / `400` / `403` / `404` / `409` / `422` / `429` / `500` |
 | POST | `/api/v1/stripe/workspaces/:workspaceId/checkout-session` | Yes (`Idempotency-Key` required) | `200` / `400` / `403` / `404` / `409` / `500` |
 
 ## 7. Detailed Postman Requests
@@ -375,6 +375,14 @@ Expected:
 12. Direct Supabase RPC `get_workspace_entitlements(UUID)` with anon key -> blocked (`401/403`)
 13. Authenticated `publish_form(...)` RPC with mismatched `p_published_by` -> blocked (`403`, SQLSTATE `42501`)
 14. Direct Supabase RPC `submit_form(...)` with anon/authenticated key -> blocked (`401/403`)
+15. Create with unsupported schema field type/operator/action -> `422 UNSUPPORTED_FORM_SCHEMA`
+16. PUT draft with unsupported schema field type/operator/action -> `422 UNSUPPORTED_FORM_SCHEMA`
+17. Publish invalid draft contract -> `422 UNSUPPORTED_FORM_SCHEMA`
+18. Runner submit against published form with `require_auth = true` -> `403 FORM_AUTH_REQUIRED`
+19. Runner submit against published form with password enabled -> `403 FORM_PASSWORD_REQUIRED`
+20. Runner submit against published form with `captcha_enabled = true` -> `403 CAPTCHA_REQUIRED_UNSUPPORTED`
+21. Signup/login with uppercase email succeeds and stored request email is normalized lowercase
+22. Malformed `Authorization` header on `/auth/me` or `/auth/logout` -> `401`
 
 ### 8.1 Security SQL Audit Snippets
 Search-path hardening audit (expect zero rows):
@@ -434,8 +442,13 @@ Expected create response:
    - `IDEMPOTENCY_KEY_REUSED_WITH_DIFFERENT_PAYLOAD`
    - `IDEMPOTENCY_KEY_EXPIRED`
    - `CATALOG_OUT_OF_SYNC`
-4. For full Stripe scenarios (webhooks, lease reclaim, drift sync, race tests), run `test-stripe-v1.md`.
-5. Runner write path is strict-gateway only: direct anon Data API inserts to `public.form_submissions` and direct anon `submit_form` RPC calls are expected to fail.
+4. Builder create/save/publish now reject runner-incompatible form contracts with `422 UNSUPPORTED_FORM_SCHEMA`.
+5. Runner protected-form fail-closed codes:
+   - `FORM_AUTH_REQUIRED`
+   - `FORM_PASSWORD_REQUIRED`
+   - `CAPTCHA_REQUIRED_UNSUPPORTED`
+6. For full Stripe scenarios (webhooks, lease reclaim, drift sync, race tests), run `test-stripe-v1.md`.
+7. Runner write path is strict-gateway only: direct anon Data API inserts to `public.form_submissions` and direct anon `submit_form` RPC calls are expected to fail.
 
 ## 10. Recommended Smoke Sequence
 Run in this order:

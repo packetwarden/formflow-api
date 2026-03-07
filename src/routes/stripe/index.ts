@@ -5,6 +5,9 @@ import type { Env, Variables } from '../../types'
 import { getServiceRoleSupabaseClient } from '../../db/supabase'
 import { requireAuth } from '../../middlewares/auth'
 import {
+    absoluteHttpUrlSchema,
+    parseInternalAdminAuthHeaders,
+    stripeSignatureHeaderSchema,
     workspaceParamSchema,
     stripeCheckoutSessionSchema,
     stripeCheckoutIdempotencyHeaderSchema,
@@ -114,6 +117,8 @@ type RequiredBillingEnvKey =
     | 'CHECKOUT_CANCEL_URL'
     | 'BILLING_PORTAL_RETURN_URL'
 
+type StripeConfigKey = RequiredBillingEnvKey | 'STRIPE_INTERNAL_ADMIN_TOKEN' | 'STRIPE_WEBHOOK_SIGNING_SECRET'
+
 type CatalogSyncResult = {
     enabled: boolean
     forced: boolean
@@ -190,7 +195,18 @@ const getCatalogSyncCron = (env: Env) => env.STRIPE_CATALOG_SYNC_CRON || DEFAULT
 const isUuid = (value: string) => /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value)
 const toIsoFromUnix = (timestamp: number | null | undefined) => (timestamp ? new Date(timestamp * 1000).toISOString() : null)
 const isNonEmptyString = (value: unknown): value is string => typeof value === 'string' && value.trim().length > 0
-const getMissingBillingEnv = (env: Env, requiredKeys: RequiredBillingEnvKey[]) => requiredKeys.filter((key) => !isNonEmptyString(env[key]))
+const getInvalidStripeEnvKeys = (
+    env: Env,
+    requiredKeys: StripeConfigKey[],
+    urlKeys: StripeConfigKey[] = []
+) => requiredKeys.filter((key) => {
+    const value = env[key]
+    if (!isNonEmptyString(value)) return true
+    if (urlKeys.includes(key)) {
+        return !absoluteHttpUrlSchema.safeParse(value).success
+    }
+    return false
+})
 
 const truncateError = (value: unknown, maxLength = 1000) => {
     const text = value instanceof Error
@@ -202,6 +218,29 @@ const truncateError = (value: unknown, maxLength = 1000) => {
 }
 
 const createCorrelationId = () => crypto.randomUUID()
+
+const digestSha256 = async (value: string) => {
+    return new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(value)))
+}
+
+const timingSafeEqual = async (left: string, right: string) => {
+    const leftDigest = await digestSha256(left)
+    const rightDigest = await digestSha256(right)
+
+    if (leftDigest.length !== rightDigest.length) return false
+
+    let diff = 0
+    for (let index = 0; index < leftDigest.length; index++) {
+        diff |= leftDigest[index] ^ rightDigest[index]
+    }
+
+    return diff === 0
+}
+
+const hasJsonContentType = (value: string | undefined) => {
+    if (!value) return false
+    return value.toLowerCase().includes('application/json')
+}
 
 const logStripe = (
     level: 'info' | 'warn' | 'error',
@@ -1768,10 +1807,17 @@ const reconcileWorkspacePlanCache = async (
     })
 }
 
-const ensureInternalCatalogSyncAuth = (env: Env, token: string | undefined) => {
+const getBillingConfigIssues = (env: Env, requiredKeys: RequiredBillingEnvKey[]) =>
+    getInvalidStripeEnvKeys(env, requiredKeys, [
+        'CHECKOUT_SUCCESS_URL',
+        'CHECKOUT_CANCEL_URL',
+        'BILLING_PORTAL_RETURN_URL',
+    ])
+
+const ensureInternalCatalogSyncAuth = async (env: Env, token: string | undefined) => {
     if (!isNonEmptyString(env.STRIPE_INTERNAL_ADMIN_TOKEN)) return false
     if (!isNonEmptyString(token)) return false
-    return token === env.STRIPE_INTERNAL_ADMIN_TOKEN
+    return timingSafeEqual(token, env.STRIPE_INTERNAL_ADMIN_TOKEN)
 }
 
 export const runStripeScheduled = async (env: Env, cron?: string) => {
@@ -1848,7 +1894,7 @@ stripeRouter.post(
             }, 400)
         }
 
-        const missingEnv = getMissingBillingEnv(c.env, [
+        const missingEnv = getBillingConfigIssues(c.env, [
             'SUPABASE_URL',
             'SUPABASE_SERVICE_ROLE_KEY',
             'STRIPE_SECRET_KEY',
@@ -2141,7 +2187,7 @@ stripeRouter.post(
         const roleCheck = await enforceWorkspaceRole(c, workspaceId, 'admin')
         if (!roleCheck.ok) return roleCheck.response
 
-        const missingEnv = getMissingBillingEnv(c.env, [
+        const missingEnv = getBillingConfigIssues(c.env, [
             'SUPABASE_URL',
             'SUPABASE_SERVICE_ROLE_KEY',
             'STRIPE_SECRET_KEY',
@@ -2187,8 +2233,24 @@ stripeRouter.post(
 )
 
 stripeRouter.post('/catalog/sync', async (c) => {
-    const adminToken = c.req.header('x-internal-admin-token') ?? c.req.header('authorization')?.replace(/^Bearer\s+/i, '')
-    if (!ensureInternalCatalogSyncAuth(c.env, adminToken)) {
+    const configIssues = getInvalidStripeEnvKeys(c.env, ['STRIPE_INTERNAL_ADMIN_TOKEN'])
+    if (configIssues.length > 0) {
+        return c.json({
+            error: 'Stripe billing configuration is incomplete',
+            code: 'BILLING_CONFIG_MISSING',
+            missing: configIssues,
+        }, 500)
+    }
+
+    const authHeadersResult = parseInternalAdminAuthHeaders({
+        authorization: c.req.header('authorization') ?? c.req.header('Authorization'),
+        'x-internal-admin-token': c.req.header('x-internal-admin-token'),
+    })
+    if (!authHeadersResult.success) {
+        return c.json({ error: 'Forbidden' }, 403)
+    }
+
+    if (!await ensureInternalCatalogSyncAuth(c.env, authHeadersResult.data.token)) {
         return c.json({ error: 'Forbidden' }, 403)
     }
 
@@ -2213,8 +2275,26 @@ stripeRouter.post('/catalog/sync', async (c) => {
 })
 
 stripeRouter.post('/webhook', async (c) => {
-    const signature = c.req.header('stripe-signature')
-    if (!signature) return c.json({ error: 'Missing Stripe signature' }, 400)
+    const configIssues = getInvalidStripeEnvKeys(c.env, [
+        'STRIPE_SECRET_KEY',
+        'STRIPE_WEBHOOK_SIGNING_SECRET',
+    ])
+    if (configIssues.length > 0) {
+        return c.json({
+            error: 'Stripe billing configuration is incomplete',
+            code: 'BILLING_CONFIG_MISSING',
+            missing: configIssues,
+        }, 500)
+    }
+
+    const signatureResult = stripeSignatureHeaderSchema.safeParse({
+        'stripe-signature': c.req.header('stripe-signature'),
+    })
+    if (!signatureResult.success) return c.json({ error: 'Missing Stripe signature' }, 400)
+
+    if (!hasJsonContentType(c.req.header('content-type'))) {
+        return c.json({ error: 'Webhook content type must be application/json' }, 400)
+    }
 
     const maxBytes = parseWebhookMaxBodyBytes(c.env)
     const contentLengthHeader = c.req.header('content-length')
@@ -2243,7 +2323,7 @@ stripeRouter.post('/webhook', async (c) => {
     try {
         event = await stripe.webhooks.constructEventAsync(
             payload,
-            signature,
+            signatureResult.data['stripe-signature'],
             c.env.STRIPE_WEBHOOK_SIGNING_SECRET,
             undefined,
             stripeCryptoProvider

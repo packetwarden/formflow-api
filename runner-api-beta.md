@@ -211,13 +211,14 @@ Privilege model:
 2. grant execute to `anon, authenticated` for read/check helper RPCs only (`check_request`, `get_published_form_by_id`, `get_form_submission_quota`)
 3. grant execute on `submit_form(...)` to `service_role`
 4. revoke direct `INSERT` on `public.form_submissions` from `anon, authenticated`
-5. hosted secret-key compatibility is handled at the Worker client layer; DB grants remain unchanged
+5. hosted secret-key compatibility is handled at the Worker client layer and by `submit_form(...)` reading the PostgREST request role with legacy JWT-role fallback; DB grants remain unchanged
 
 Rollout artifacts:
 1. migration: `project-info-docs/migrations/2026-02-23_runner_public_api_v1.sql`
 2. migration: `project-info-docs/migrations/2026-02-24_runner_strict_submit_rate_limit.sql`
 3. migration: `project-info-docs/migrations/2026-02-27_runner_submission_gateway_hardening_v1.sql`
-4. canonical baseline: `project-info-docs/formflow_beta_schema_v2.sql`
+4. migration: `project-info-docs/migrations/2026-03-07_runner_service_role_secret_key_compat_v1.sql`
+5. canonical baseline: `project-info-docs/formflow_beta_schema_v2.sql`
 
 ## 8. Operational Runbook
 ### 8.1 Migration Order
@@ -226,6 +227,7 @@ Existing environment:
 2. `project-info-docs/migrations/2026-02-23_runner_public_api_v1.sql`
 3. `project-info-docs/migrations/2026-02-24_runner_strict_submit_rate_limit.sql`
 4. `project-info-docs/migrations/2026-02-27_runner_submission_gateway_hardening_v1.sql`
+5. `project-info-docs/migrations/2026-03-07_runner_service_role_secret_key_compat_v1.sql`
 
 Fresh environment:
 1. apply `project-info-docs/formflow_beta_schema_v2.sql`

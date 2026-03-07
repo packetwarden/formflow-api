@@ -9,6 +9,7 @@ import {
     enforceWorkspaceRole,
     getAuthScopedSupabaseClient,
 } from '../../utils/workspace-access'
+import { parsePublishedContract } from '../../utils/form-contract'
 import {
     buildParamSchema,
     buildSubmissionListQuerySchema,
@@ -209,6 +210,19 @@ const checkCreateFormEntitlement = async (c: BuildContext, workspaceId: string) 
     return { ok: true as const }
 }
 
+const toUnsupportedSchemaResponse = (c: BuildContext, issues: string[]) => {
+    return c.json({
+        error: 'Unsupported form schema',
+        code: 'UNSUPPORTED_FORM_SCHEMA',
+        issues,
+    }, 422)
+}
+
+const validateDraftContract = (schema: unknown) => {
+    const contractResult = parsePublishedContract(schema)
+    return contractResult.ok ? null : contractResult.issues
+}
+
 /**
  * GET /api/v1/build/:workspaceId/forms
  * Returns forms for the workspace with summary metadata.
@@ -260,6 +274,11 @@ buildRouter.post(
 
         const workspaceRole = await enforceWorkspaceRole(c, workspaceId, 'editor')
         if (!workspaceRole.ok) return workspaceRole.response
+
+        if (schema !== undefined) {
+            const schemaIssues = validateDraftContract(schema)
+            if (schemaIssues) return toUnsupportedSchemaResponse(c, schemaIssues)
+        }
 
         const entitlement = await checkCreateFormEntitlement(c, workspaceId)
         if (!entitlement.ok) return entitlement.response
@@ -528,6 +547,9 @@ buildRouter.put(
         const workspaceRole = await enforceWorkspaceRole(c, workspaceId, 'editor')
         if (!workspaceRole.ok) return workspaceRole.response
 
+        const schemaIssues = validateDraftContract(schema)
+        if (schemaIssues) return toUnsupportedSchemaResponse(c, schemaIssues)
+
         const supabase = getScopedSupabaseClient(c)
 
         const { data: updatedForm, error: updateError } = await supabase
@@ -597,7 +619,7 @@ buildRouter.post(
 
         const { data: form, error: formCheckError } = await supabase
             .from('forms')
-            .select('id')
+            .select('id, schema')
             .eq('id', formId)
             .eq('workspace_id', workspaceId)
             .is('deleted_at', null)
@@ -611,6 +633,9 @@ buildRouter.post(
         if (!form) {
             return c.json({ error: 'Form not found' }, 404)
         }
+
+        const schemaIssues = validateDraftContract(form.schema)
+        if (schemaIssues) return toUnsupportedSchemaResponse(c, schemaIssues)
 
         const { data: publishedVersion, error: publishError } = await supabase.rpc('publish_form', {
             p_form_id: formId,

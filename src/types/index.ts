@@ -35,7 +35,18 @@ export type RunnerErrorCode =
     | 'PLAN_FEATURE_DISABLED'
     | 'PLAN_LIMIT_EXCEEDED'
     | 'RATE_LIMITED'
+    | 'FORM_AUTH_REQUIRED'
+    | 'FORM_PASSWORD_REQUIRED'
+    | 'CAPTCHA_REQUIRED_UNSUPPORTED'
+    | 'RATE_LIMIT_CONTEXT_MISSING'
+    | 'RATE_LIMIT_CHECK_FAILED'
     | 'RUNNER_BACKEND_AUTH_MISCONFIGURED'
+    | 'RUNNER_INTERNAL_ERROR'
+
+export type ValidationIssue = {
+    field_id: string
+    message: string
+}
 
 export interface RunnerSubmitSuccessResponse {
     submission_id: string

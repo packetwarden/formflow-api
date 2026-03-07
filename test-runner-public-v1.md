@@ -30,6 +30,7 @@ Before running tests:
    - `project-info-docs/migrations/2026-02-24_runner_strict_submit_rate_limit.sql`
    - `project-info-docs/migrations/2026-02-27_runner_submission_gateway_hardening_v1.sql`
    - `project-info-docs/migrations/2026-02-27_security_definer_hardening_v2.sql`
+   - `project-info-docs/migrations/2026-03-07_runner_service_role_secret_key_compat_v1.sql`
 4. Prepare published test forms (see Section 4).
 5. Confirm `check_request()` strict gate is active for submit-path rate-limit tests.
 
@@ -436,12 +437,18 @@ Use `form_id_valid` and mutate one field per request.
 10. Submission conflict state -> `409`
 11. Entitlement disabled -> `403 PLAN_FEATURE_DISABLED`
 12. Entitlement exceeded -> `403 PLAN_LIMIT_EXCEEDED`
-13. Backend submit client misconfigured -> `500 RUNNER_BACKEND_AUTH_MISCONFIGURED`
-14. Burst submissions -> `429`
-15. Direct Supabase Data API `INSERT` to `public.form_submissions` with anon key -> blocked (`401/403`)
-16. Direct Supabase RPC `submit_form` call with anon key -> blocked (`401/403`)
-17. Direct Supabase RPC `get_workspace_entitlements(UUID)` with anon key -> blocked (`401/403`)
-18. Direct Supabase RPC `check_request()` with authenticated key -> blocked (`401/403`)
+13. Published form with `require_auth = true` -> `403 FORM_AUTH_REQUIRED`
+14. Published form with password enabled -> `403 FORM_PASSWORD_REQUIRED`
+15. Published form with `captcha_enabled = true` -> `403 CAPTCHA_REQUIRED_UNSUPPORTED`
+16. `started_at` more than 5 minutes in the future -> `400`
+17. `started_at` older than 30 days -> `400`
+18. Invalid `referer` header is ignored and submit still succeeds when all other inputs are valid
+19. Backend submit client misconfigured -> `500 RUNNER_BACKEND_AUTH_MISCONFIGURED`
+20. Burst submissions -> `429`
+21. Direct Supabase Data API `INSERT` to `public.form_submissions` with anon key -> blocked (`401/403`)
+22. Direct Supabase RPC `submit_form` call with anon key -> blocked (`401/403`)
+23. Direct Supabase RPC `get_workspace_entitlements(UUID)` with anon key -> blocked (`401/403`)
+24. Direct Supabase RPC `check_request()` with authenticated key -> blocked (`401/403`)
 
 ### 9.1 Security SQL Audit Snippets
 Search-path hardening audit (expect zero rows):

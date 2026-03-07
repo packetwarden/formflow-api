@@ -859,8 +859,13 @@ WHERE w.id = '<workspace_id_under_test>';
 13. oversized webhook body -> `413`
 14. duplicate webhook replay -> `200` and no duplicate side effects
 15. `/api/v1/stripe/catalog/sync` without internal token -> `403`
-16. catalog sync does not repair missing/deleted Stripe customer mappings
-17. `invoice.created` (valid signature) -> `200` with `ack_only = true` and no durable queue insert
+16. `/api/v1/stripe/catalog/sync` with mismatched `x-internal-admin-token` and Bearer token -> `403`
+17. missing `STRIPE_INTERNAL_ADMIN_TOKEN` on `/api/v1/stripe/catalog/sync` -> `500 BILLING_CONFIG_MISSING`
+18. malformed billing return/success/cancel URL env -> `500 BILLING_CONFIG_MISSING`
+19. webhook with non-JSON content type -> `400`
+20. missing `STRIPE_WEBHOOK_SIGNING_SECRET` -> `500 BILLING_CONFIG_MISSING`
+21. catalog sync does not repair missing/deleted Stripe customer mappings
+22. `invoice.created` (valid signature) -> `200` with `ack_only = true` and no durable queue insert
 
 ## 9. Expected Response Shapes
 Checkout success (`200`):

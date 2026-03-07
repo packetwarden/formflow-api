@@ -1,6 +1,7 @@
 import { Context, Next } from 'hono'
 import { getSupabaseClient } from '../db/supabase'
 import { Env, Variables } from '../types'
+import { parseBearerAuthorizationHeader } from '../utils/validation'
 
 /**
  * requireAuth middleware ensures that a valid Bearer token is provided.
@@ -8,17 +9,14 @@ import { Env, Variables } from '../types'
  * If valid, it attaches the user object to the Hono context (c.set('user', user)).
  */
 export const requireAuth = async (c: Context<{ Bindings: Env; Variables: Variables }>, next: Next) => {
-    const authHeader = c.req.header('Authorization')
+    const headerResult = parseBearerAuthorizationHeader(
+        c.req.header('authorization') ?? c.req.header('Authorization')
+    )
 
-    if (!authHeader || !authHeader.startsWith('Bearer ')) {
+    if (!headerResult.success) {
         return c.json({ error: 'Unauthorized: Missing or invalid Authorization header' }, 401)
     }
-
-    const token = authHeader.split(' ')[1]?.trim()
-
-    if (!token) {
-        return c.json({ error: 'Unauthorized: Missing token' }, 401)
-    }
+    const token = headerResult.data.token
 
     try {
         // We instantiate the client solely for verification.
