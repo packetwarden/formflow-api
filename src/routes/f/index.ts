@@ -1030,7 +1030,15 @@ const sanitizeAndValidateData = (
 
 const parseSubmissionRpcError = (error: { code: string | null; message: string }) => {
     if (error.code === 'P0002') return { status: 404 as const, payload: { error: 'Form not found' } }
-    if (error.code === '42501') return { status: 403 as const, payload: { error: 'Forbidden' } }
+    if (error.code === '42501') {
+        return {
+            status: 500 as const,
+            payload: {
+                error: 'Submission service misconfigured',
+                code: 'RUNNER_BACKEND_AUTH_MISCONFIGURED' as const,
+            },
+        }
+    }
 
     if (['P0003', 'P0004', 'P0005', 'P0006', 'P0007', 'P0008'].includes(error.code ?? '')) {
         return {
@@ -1290,6 +1298,13 @@ runnerRouter.post(
             if (submitError) {
                 const mappedError = parseSubmissionRpcError(submitError)
                 if (mappedError) {
+                    if (submitError.code === '42501') {
+                        console.error('Runner submit RPC auth/config error:', {
+                            code: submitError.code,
+                            message: submitError.message,
+                            details: 'Trusted backend submit RPC rejected',
+                        })
+                    }
                     return c.json(mappedError.payload, mappedError.status)
                 }
 

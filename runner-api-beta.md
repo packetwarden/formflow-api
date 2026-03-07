@@ -94,6 +94,8 @@ Submit path sequence:
 8. reject unknown keys and validate visible field values
 9. enforce monthly entitlement with `public.get_form_submission_quota(formId)`
 10. build trusted submit client using `SUPABASE_SERVICE_ROLE_KEY`
+   - supported values: legacy JWT `service_role` or hosted `sb_secret_*`
+   - when the backend key is non-JWT (`sb_secret_*`), the shared client keeps `apikey` auth and strips invalid `Authorization: Bearer <secret>` fallback
 11. execute `public.submit_form(...)` with sanitized payload and metadata
 12. return `submission_id` + completion settings
 
@@ -190,6 +192,7 @@ Defense layers:
 4. DB-backed entitlement guard (`get_form_submission_quota`)
 5. strict gateway write path: only Worker trusted submit client can execute `submit_form`
 6. atomic idempotent write path (`submit_form`)
+7. hosted `sb_secret_*` backend keys are supported without weakening the DB privilege model
 
 Failure-mode rationale:
 1. public endpoint receives untrusted traffic
@@ -208,6 +211,7 @@ Privilege model:
 2. grant execute to `anon, authenticated` for read/check helper RPCs only (`check_request`, `get_published_form_by_id`, `get_form_submission_quota`)
 3. grant execute on `submit_form(...)` to `service_role`
 4. revoke direct `INSERT` on `public.form_submissions` from `anon, authenticated`
+5. hosted secret-key compatibility is handled at the Worker client layer; DB grants remain unchanged
 
 Rollout artifacts:
 1. migration: `project-info-docs/migrations/2026-02-23_runner_public_api_v1.sql`
@@ -256,16 +260,18 @@ SELECT
 5. unknown payload field returns `422 FIELD_VALIDATION_FAILED`
 6. rate-limit overflow returns `429 RATE_LIMITED`
 7. disabled/exceeded quota returns `403` with plan error code
+8. backend auth/config drift returns `500 RUNNER_BACKEND_AUTH_MISCONFIGURED`
 
 Primary test document:
 1. `test-runner-public-v1.md`
 
 ### 8.4 Runtime Stability Notes
 1. `@hono/zod-validator` remains the request validation layer for `formId` params and submit JSON body.
-2. `/submit` includes defensive runtime containment:
+2. if Supabase logs show `jwt: []` together with `Authorization: Bearer sb_secret_...` on `/rest/v1/rpc/submit_form`, the Worker backend client is forwarding a hosted secret key incorrectly.
+3. `/submit` includes defensive runtime containment:
    - `parseStrictRateLimitError` safely parses non-standard RPC error payloads and maps strict 4xx/429 responses.
    - top-level `try/catch` wraps submit execution to prevent opaque worker-level 500 crashes.
-3. If an unhandled submit-path exception still occurs, response contract is:
+4. If an unhandled submit-path exception still occurs, response contract is:
    - status: `500`
    - body: `{ "error": "Failed to submit form", "code": "RUNNER_INTERNAL_ERROR" }`
 

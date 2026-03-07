@@ -1,5 +1,9 @@
 import { createClient, SupabaseClient } from '@supabase/supabase-js'
 
+const isNonJwtSupabaseApiKey = (supabaseKey: string) => {
+    return supabaseKey.startsWith('sb_secret_') || supabaseKey.startsWith('sb_publishable_')
+}
+
 /**
  * Creates a configured Supabase client suitable for Edge Runtimes.
  * It enforces auth.autoRefreshToken: false and auth.persistSession: false
@@ -17,7 +21,7 @@ export const getSupabaseClient = (
     accessToken?: string,
     extraHeaders?: Record<string, string>
 ): SupabaseClient => {
-    const options: Parameters<typeof createClient>[2] = {
+    const clientOptions: Parameters<typeof createClient>[2] = {
         auth: {
             autoRefreshToken: false,
             persistSession: false,
@@ -34,13 +38,33 @@ export const getSupabaseClient = (
         }
     }
 
-    if (Object.keys(headers).length > 0) {
-        options.global = {
-            headers
+    const customFetch: typeof fetch = async (input, init) => {
+        const requestHeaders = new Headers(init?.headers ?? (input instanceof Request ? input.headers : undefined))
+
+        // Supabase hosted secret/publishable keys are not JWTs. Let apikey auth
+        // reach the gateway without mirroring the key into Authorization.
+        if (!accessToken && isNonJwtSupabaseApiKey(supabaseKey)) {
+            const defaultAuthorization = `Bearer ${supabaseKey}`
+            if (requestHeaders.get('Authorization') === defaultAuthorization) {
+                requestHeaders.delete('Authorization')
+            }
         }
+
+        return fetch(input, {
+            ...init,
+            headers: requestHeaders,
+        })
     }
 
-    return createClient(supabaseUrl, supabaseKey, options)
+    clientOptions.global = {
+        fetch: customFetch,
+    }
+
+    if (Object.keys(headers).length > 0) {
+        clientOptions.global.headers = headers
+    }
+
+    return createClient(supabaseUrl, supabaseKey, clientOptions)
 }
 
 export const getServiceRoleSupabaseClient = (

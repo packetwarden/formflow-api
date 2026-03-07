@@ -98,7 +98,14 @@ Context contract (`src/types/index.ts`):
     - `global.headers.Authorization = Bearer <token>`
 3. if `extraHeaders` is provided, headers are merged into `global.headers`:
    - runner usage: `x-forwarded-for`, `user-agent`, `referer`
-4. edge-safe options enforced:
+4. hosted Supabase secret/publishable API keys are treated as non-JWT project keys:
+   - supported formats: `sb_secret_*`, `sb_publishable_*`
+   - when no explicit `accessToken` is present, the shared client strips `Authorization: Bearer <project_key>` before dispatch
+   - `apikey` is preserved so the Supabase gateway can mint the short-lived backend JWT
+5. `SUPABASE_SERVICE_ROLE_KEY` may be either:
+   - legacy JWT `service_role`
+   - hosted secret key `sb_secret_*`
+6. edge-safe options enforced:
     - `auth.autoRefreshToken = false`
     - `auth.persistSession = false`
     - `auth.detectSessionInUrl = false`
@@ -106,6 +113,7 @@ Context contract (`src/types/index.ts`):
 Why this matters:
 1. RLS is evaluated against the caller JWT, not service context.
 2. Build routes remain multi-tenant safe with database-side access control.
+3. runner/stripe backend paths remain compatible with modern hosted Supabase secret keys without mirroring non-JWT keys into `Authorization`.
 
 ## 8. Build API v1 (Beta-Complete)
 Build router file: `src/routes/build/index.ts`
@@ -455,6 +463,8 @@ Execution flow:
 7. enforce strict field-level validation for visible fields
 8. enforce monthly entitlement with `get_form_submission_quota`
 9. build trusted submit client using `SUPABASE_SERVICE_ROLE_KEY`
+   - supported values: legacy JWT `service_role` or hosted `sb_secret_*`
+   - hosted secret keys are sent through `apikey`; the shared client strips invalid `Authorization: Bearer <secret>` fallback when no explicit JWT is present
 10. call `submit_form` RPC with:
    - `p_form_id`
    - sanitized `p_data`
@@ -495,6 +505,7 @@ Status mapping:
 6. `422` strict schema or field validation failure (`UNSUPPORTED_FORM_SCHEMA`, `FIELD_VALIDATION_FAILED`)
 7. `429` rate-limited
 8. `500` internal or RPC failure
+   - privileged submit RPC auth/config failure returns `RUNNER_BACKEND_AUTH_MISCONFIGURED`
 
 ### 8A.3 Submit Runtime Hardening (Post Dependency Upgrade)
 Additional hardening in `src/routes/f/index.ts`:
@@ -657,6 +668,7 @@ Canonical launch baseline status:
 4. SECURITY DEFINER hardening:
    - trigger SECURITY DEFINER functions use `SET search_path = ''`
    - `submit_form(...)` enforces request JWT role `service_role` in-function
+   - hosted `sb_secret_*` backend keys remain compatible because Supabase gateway auth is driven by `apikey` and mints the backend JWT
    - `REVOKE CREATE ON SCHEMA public FROM PUBLIC` to reduce object-shadowing risk
 
 Runner contract additions in V2:
@@ -675,6 +687,8 @@ Runner contract additions in V2:
 4. submission table hardening:
    - removed permissive insert policy (`WITH CHECK (true)`) on `public.form_submissions`
    - revoked direct `INSERT` on `public.form_submissions` from `anon` and `authenticated`
+5. troubleshooting signal for hosted secret-key drift:
+   - Supabase API logs showing `jwt: []` together with `Authorization: Bearer sb_secret_...` and `403/42501` on `/rest/v1/rpc/submit_form` indicate backend client misconfiguration, not caller authorization failure
 
 RLS initplan wrapper hardening in V2:
 1. all policies that use `private.user_workspace_ids()`, `private.user_editable_workspace_ids()`, or `private.user_admin_workspace_ids()` now use:

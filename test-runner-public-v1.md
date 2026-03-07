@@ -22,6 +22,7 @@ Before running tests:
    - `SUPABASE_URL`
    - `SUPABASE_ANON_KEY`
    - `SUPABASE_SERVICE_ROLE_KEY`
+   - recommended primary coverage: use hosted `sb_secret_*` for `SUPABASE_SERVICE_ROLE_KEY`
 2. Database must be on `project-info-docs/formflow_beta_schema_v2.sql`.
 3. For upgraded environments, apply migrations in order:
    - `project-info-docs/migrations/2026-02-23_fix_publish_form.sql`
@@ -362,7 +363,24 @@ Expected:
 1. Status `409`
 2. body includes `error = "Form state conflict"`
 
-### 7.17 Rate-Limit (`429`) via Collection Runner
+### 7.17 Backend Submit Misconfiguration (`500 RUNNER_BACKEND_AUTH_MISCONFIGURED`)
+Setup:
+1. Temporarily misconfigure `SUPABASE_SERVICE_ROLE_KEY` in the Worker environment.
+2. Use either:
+   - an invalid secret value, or
+   - a local code tweak that forwards `Authorization: Bearer sb_secret_...` to reproduce the known bad shape.
+
+Request:
+1. Method: `POST`
+2. URL: `{{base_url}}/api/v1/f/{{form_id_valid}}/submit`
+3. Standard submit headers
+
+Expected:
+1. Status `500`
+2. `code = RUNNER_BACKEND_AUTH_MISCONFIGURED`
+3. client response does not expose raw PostgREST internals
+
+### 7.18 Rate-Limit (`429`) via Collection Runner
 Setup:
 1. Create one request targeting:
    - `POST {{base_url}}/api/v1/f/{{form_id_valid}}/submit`
@@ -418,11 +436,12 @@ Use `form_id_valid` and mutate one field per request.
 10. Submission conflict state -> `409`
 11. Entitlement disabled -> `403 PLAN_FEATURE_DISABLED`
 12. Entitlement exceeded -> `403 PLAN_LIMIT_EXCEEDED`
-13. Burst submissions -> `429`
-14. Direct Supabase Data API `INSERT` to `public.form_submissions` with anon key -> blocked (`401/403`)
-15. Direct Supabase RPC `submit_form` call with anon key -> blocked (`401/403`)
-16. Direct Supabase RPC `get_workspace_entitlements(UUID)` with anon key -> blocked (`401/403`)
-17. Direct Supabase RPC `check_request()` with authenticated key -> blocked (`401/403`)
+13. Backend submit client misconfigured -> `500 RUNNER_BACKEND_AUTH_MISCONFIGURED`
+14. Burst submissions -> `429`
+15. Direct Supabase Data API `INSERT` to `public.form_submissions` with anon key -> blocked (`401/403`)
+16. Direct Supabase RPC `submit_form` call with anon key -> blocked (`401/403`)
+17. Direct Supabase RPC `get_workspace_entitlements(UUID)` with anon key -> blocked (`401/403`)
+18. Direct Supabase RPC `check_request()` with authenticated key -> blocked (`401/403`)
 
 ### 9.1 Security SQL Audit Snippets
 Search-path hardening audit (expect zero rows):
@@ -518,12 +537,13 @@ Run in this order:
 5. Unsupported schema (`7.11`)
 6. Unsupported logic (`7.12`)
 7. Quota enforcement (`7.14`, `7.15`)
-8. Rate-limit burst (`7.17`)
+8. Rate-limit burst (`7.18`)
+9. Backend submit misconfiguration (`7.17`)
 
 Pass criteria:
 1. Success-path requests return expected `200`/`201`.
 2. Contract-violation requests return deterministic `4xx` codes.
-3. No unexpected `5xx` responses.
+3. Only intentional backend-misconfiguration checks return `500 RUNNER_BACKEND_AUTH_MISCONFIGURED`.
 4. Direct Supabase write-path bypass attempts are blocked with `401/403`.
 
 ## 12. Release Checklist
@@ -533,3 +553,5 @@ Pass criteria:
 4. Strict fail-closed coverage complete for unsupported schema and logic
 5. Entitlement and rate-limit behaviors verified in target environment
 6. Direct Supabase submission bypass attempts are blocked
+7. Hosted `sb_secret_*` backend submit path verified
+8. Legacy JWT `service_role` compatibility verified if still enabled in staging

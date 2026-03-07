@@ -35,6 +35,7 @@ export type RunnerErrorCode =
     | 'PLAN_FEATURE_DISABLED'
     | 'PLAN_LIMIT_EXCEEDED'
     | 'RATE_LIMITED'
+    | 'RUNNER_BACKEND_AUTH_MISCONFIGURED'
 
 export interface RunnerSubmitSuccessResponse {
     submission_id: string
