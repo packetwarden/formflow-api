@@ -1,10 +1,15 @@
+import { compare } from 'bcryptjs'
 import { Hono } from 'hono'
 import type { Context } from 'hono'
 import { zValidator } from '@hono/zod-validator'
-import { getSupabaseClient } from '../../db/supabase'
+import { getServiceRoleSupabaseClient, getSupabaseClient } from '../../db/supabase'
 import type { Env, RunnerSubmitSuccessResponse } from '../../types'
+import { issueFormAccessToken, verifyFormAccessToken } from '../../utils/form-access'
 import { parsePublishedContract, sanitizeAndValidateData } from '../../utils/form-contract'
+import { verifyTurnstileToken } from '../../utils/turnstile'
 import {
+    parseRunnerFormAccessHeaders,
+    runnerAccessBodySchema,
     runnerFormParamSchema,
     runnerIdempotencyHeaderSchema,
     runnerSubmitBodySchema,
@@ -30,6 +35,13 @@ type PublishedFormRow = {
     captcha_provider: string | null
     require_auth: boolean
     password_protected: boolean
+    version: number
+}
+
+type ProtectedFormLookupRow = {
+    id: string
+    version: number
+    password_hash: string | null
 }
 
 type QuotaRow = {
@@ -39,6 +51,8 @@ type QuotaRow = {
     current_usage: number
     workspace_id: string
 }
+
+const PASSWORD_RATE_LIMIT_RETRY_AFTER_SECONDS = 10 * 60
 
 const isRecord = (value: unknown): value is Record<string, unknown> => {
     return typeof value === 'object' && value !== null && !Array.isArray(value)
@@ -91,11 +105,8 @@ const getRunnerSupabaseClient = (c: RunnerContext) => {
     )
 }
 
-const getRunnerSubmitSupabaseClient = (c: RunnerContext) => {
-    return getSupabaseClient(
-        c.env.SUPABASE_URL,
-        c.env.SUPABASE_SERVICE_ROLE_KEY
-    )
+const getRunnerServiceRoleSupabaseClient = (c: RunnerContext) => {
+    return getServiceRoleSupabaseClient(c.env.SUPABASE_URL, c.env.SUPABASE_SERVICE_ROLE_KEY)
 }
 
 const parseSubmissionRpcError = (error: { code: string | null; message: string }) => {
@@ -186,25 +197,105 @@ const parseStrictRateLimitError = (error: unknown) => {
     return null
 }
 
+const toPublishedForm = (data: unknown) => {
+    return (Array.isArray(data) ? data[0] : null) as PublishedFormRow | null
+}
+
+const loadPublishedForm = async (c: RunnerContext, formId: string) => {
+    const supabase = getRunnerSupabaseClient(c)
+    const { data, error } = await supabase.rpc('get_published_form_by_id', {
+        p_form_id: formId,
+    })
+
+    if (error) {
+        console.error('Runner form lookup error:', error)
+        return { ok: false as const, response: c.json({ error: 'Failed to fetch form' }, 500) }
+    }
+
+    const form = toPublishedForm(data)
+    if (!form) {
+        return { ok: false as const, response: c.json({ error: 'Form not found' }, 404) }
+    }
+
+    return { ok: true as const, form }
+}
+
+const toLockedSchemaResponse = (c: RunnerContext, form: PublishedFormRow) => {
+    return c.json({
+        error: 'Password protection is enabled for this form',
+        code: 'FORM_PASSWORD_REQUIRED',
+        form: {
+            id: form.form_id,
+            title: form.title,
+            description: form.description,
+            password_protected: true,
+            captcha_enabled: form.captcha_enabled,
+            captcha_provider: form.captcha_enabled ? form.captcha_provider ?? 'turnstile' : null,
+            captcha_site_key: form.captcha_enabled ? c.env.TURNSTILE_SITE_KEY : null,
+        },
+    }, 403)
+}
+
+const hasValidAccessToken = async (c: RunnerContext, form: PublishedFormRow) => {
+    const rawHeader = c.req.header('x-form-access-token')
+    if (!rawHeader) return false
+
+    const parsedHeader = parseRunnerFormAccessHeaders({
+        'x-form-access-token': rawHeader,
+    })
+
+    if (!parsedHeader.success) return false
+
+    const verification = await verifyFormAccessToken(
+        c.env,
+        parsedHeader.data['x-form-access-token'],
+        form.form_id,
+        form.version
+    )
+
+    return verification.ok
+}
+
+const enforcePasswordAccessRateLimit = async (c: RunnerContext, formId: string, clientIp: string) => {
+    const limiter = c.env.RUNNER_PASSWORD_RATE_LIMITER
+    if (!limiter || typeof limiter.limit !== 'function') {
+        console.error('[runner-password-rate-limit] Missing RUNNER_PASSWORD_RATE_LIMITER binding')
+        return c.json({ error: 'Failed to evaluate password rate limit' }, 500)
+    }
+
+    try {
+        const { success } = await limiter.limit({ key: `form_access|${formId}|${clientIp}` })
+        if (success) return null
+
+        c.header('Retry-After', String(PASSWORD_RATE_LIMIT_RETRY_AFTER_SECONDS))
+        return c.json(
+            {
+                error: 'Too many password attempts. Please try again later.',
+                code: 'RATE_LIMITED',
+            },
+            429
+        )
+    } catch (error) {
+        console.error('[runner-password-rate-limit] Limiter failure', error)
+        return c.json({ error: 'Failed to evaluate password rate limit' }, 500)
+    }
+}
+
 runnerRouter.get(
     '/:formId/schema',
     zValidator('param', runnerFormParamSchema),
     async (c) => {
         const { formId } = c.req.valid('param')
-        const supabase = getRunnerSupabaseClient(c)
+        const loadedForm = await loadPublishedForm(c, formId)
+        if (!loadedForm.ok) return loadedForm.response
 
-        const { data, error } = await supabase.rpc('get_published_form_by_id', {
-            p_form_id: formId,
-        })
+        const { form } = loadedForm
 
-        if (error) {
-            console.error('Runner schema fetch error:', error)
-            return c.json({ error: 'Failed to fetch form schema' }, 500)
-        }
-
-        const form = (Array.isArray(data) ? data[0] : null) as PublishedFormRow | null
-        if (!form) {
-            return c.json({ error: 'Form not found' }, 404)
+        if (form.password_protected) {
+            const accessTokenValid = await hasValidAccessToken(c, form)
+            if (!accessTokenValid) {
+                return toLockedSchemaResponse(c, form)
+            }
         }
 
         return c.json({
@@ -219,10 +310,92 @@ runnerRouter.get(
                 meta_description: form.meta_description,
                 meta_image_url: form.meta_image_url,
                 captcha_enabled: form.captcha_enabled,
-                captcha_provider: form.captcha_provider,
+                captcha_provider: form.captcha_enabled ? form.captcha_provider ?? 'turnstile' : null,
+                captcha_site_key: form.captcha_enabled ? c.env.TURNSTILE_SITE_KEY : null,
                 require_auth: form.require_auth,
                 password_protected: form.password_protected,
             },
+        }, 200)
+    }
+)
+
+runnerRouter.post(
+    '/:formId/access',
+    zValidator('param', runnerFormParamSchema),
+    zValidator('json', runnerAccessBodySchema),
+    async (c) => {
+        const { formId } = c.req.valid('param')
+        const { password, captcha_token } = c.req.valid('json')
+        const clientIp = extractClientIp(c)
+
+        if (!clientIp) {
+            return c.json({
+                error: 'Unable to determine client IP for rate limit enforcement',
+                code: 'RATE_LIMIT_CONTEXT_MISSING',
+            }, 400)
+        }
+
+        const loadedForm = await loadPublishedForm(c, formId)
+        if (!loadedForm.ok) return loadedForm.response
+        const { form } = loadedForm
+
+        const rateLimited = await enforcePasswordAccessRateLimit(c, formId, clientIp)
+        if (rateLimited) return rateLimited
+
+        if (form.require_auth) {
+            return c.json({
+                error: 'Authentication is required for this form',
+                code: 'FORM_AUTH_REQUIRED',
+            }, 403)
+        }
+
+        if (!form.password_protected) {
+            return c.json({ error: 'Password protection is not enabled for this form' }, 409)
+        }
+
+        if (form.captcha_enabled) {
+            const captchaVerification = await verifyTurnstileToken({
+                env: c.env,
+                token: captcha_token,
+                action: 'form_access',
+                remoteIp: clientIp,
+            })
+
+            if (!captchaVerification.ok) {
+                return c.json(captchaVerification.payload, 403)
+            }
+        }
+
+        const serviceRoleSupabase = getRunnerServiceRoleSupabaseClient(c)
+        const { data: protectedForm, error: protectedFormError } = await serviceRoleSupabase
+            .from('forms')
+            .select('id, version, password_hash')
+            .eq('id', formId)
+            .is('deleted_at', null)
+            .maybeSingle()
+
+        if (protectedFormError) {
+            console.error('Runner access lookup error:', protectedFormError)
+            return c.json({ error: 'Failed to fetch form access state' }, 500)
+        }
+
+        const passwordHash = (protectedForm as ProtectedFormLookupRow | null)?.password_hash ?? null
+        if (!passwordHash) {
+            return c.json({ error: 'Password protection is not enabled for this form' }, 409)
+        }
+
+        const passwordMatches = await compare(password, passwordHash)
+        if (!passwordMatches) {
+            return c.json({
+                error: 'Password is incorrect',
+                code: 'FORM_PASSWORD_INVALID',
+            }, 403)
+        }
+
+        const accessToken = await issueFormAccessToken(c.env, form.form_id, form.version)
+        return c.json({
+            access_token: accessToken.token,
+            expires_at: accessToken.expiresAt,
         }, 200)
     }
 )
@@ -234,7 +407,7 @@ runnerRouter.post(
     async (c) => {
         try {
             const { formId } = c.req.valid('param')
-            const { data, started_at } = c.req.valid('json')
+            const { data, started_at, captcha_token } = c.req.valid('json')
 
             const headerValidation = runnerIdempotencyHeaderSchema.safeParse({
                 'idempotency-key': c.req.header('idempotency-key') ?? c.req.header('Idempotency-Key'),
@@ -261,7 +434,6 @@ runnerRouter.post(
             }
 
             const supabase = getRunnerSupabaseClient(c)
-
             const { error: strictRateLimitError } = await supabase.rpc('check_request')
             if (strictRateLimitError) {
                 const mappedRateLimit = parseStrictRateLimitError(strictRateLimitError)
@@ -279,19 +451,9 @@ runnerRouter.post(
                 }, 500)
             }
 
-            const { data: formRows, error: formError } = await supabase.rpc('get_published_form_by_id', {
-                p_form_id: formId,
-            })
-
-            if (formError) {
-                console.error('Runner form lookup error:', formError)
-                return c.json({ error: 'Failed to fetch form' }, 500)
-            }
-
-            const form = (Array.isArray(formRows) ? formRows[0] : null) as PublishedFormRow | null
-            if (!form) {
-                return c.json({ error: 'Form not found' }, 404)
-            }
+            const loadedForm = await loadPublishedForm(c, formId)
+            if (!loadedForm.ok) return loadedForm.response
+            const { form } = loadedForm
 
             if (form.require_auth) {
                 return c.json({
@@ -301,17 +463,27 @@ runnerRouter.post(
             }
 
             if (form.password_protected) {
-                return c.json({
-                    error: 'Password protection is enabled for this form',
-                    code: 'FORM_PASSWORD_REQUIRED',
-                }, 403)
+                const accessTokenValid = await hasValidAccessToken(c, form)
+                if (!accessTokenValid) {
+                    return c.json({
+                        error: 'A valid form access token is required',
+                        code: 'FORM_ACCESS_TOKEN_INVALID',
+                    }, 403)
+                }
             }
 
             if (form.captcha_enabled) {
-                return c.json({
-                    error: 'Captcha verification is required for this form',
-                    code: 'CAPTCHA_REQUIRED_UNSUPPORTED',
-                }, 403)
+                const captchaVerification = await verifyTurnstileToken({
+                    env: c.env,
+                    token: captcha_token,
+                    action: 'form_submit',
+                    remoteIp: clientIp,
+                    idempotencyKey,
+                })
+
+                if (!captchaVerification.ok) {
+                    return c.json(captchaVerification.payload, 403)
+                }
             }
 
             const contractResult = parsePublishedContract(form.published_schema)
@@ -374,7 +546,7 @@ runnerRouter.post(
 
             const userAgentResult = safeUserAgentSchema.safeParse(c.req.header('user-agent'))
             const refererResult = safeRefererSchema.safeParse(c.req.header('referer'))
-            const submitSupabase = getRunnerSubmitSupabaseClient(c)
+            const submitSupabase = getRunnerServiceRoleSupabaseClient(c)
 
             const { data: submissionId, error: submitError } = await submitSupabase.rpc('submit_form', {
                 p_form_id: formId,

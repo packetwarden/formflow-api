@@ -8,6 +8,8 @@ const MAX_DESCRIPTION_LENGTH = 2000
 const MAX_SUCCESS_MESSAGE_LENGTH = 1000
 const MAX_PUBLISH_DESCRIPTION_LENGTH = 500
 const MAX_USER_AGENT_LENGTH = 1024
+const MAX_CAPTCHA_TOKEN_LENGTH = 4096
+const MAX_FORM_ACCESS_TOKEN_LENGTH = 2048
 const MAX_STARTED_AT_FUTURE_SKEW_MS = 5 * 60 * 1000
 const MAX_STARTED_AT_AGE_MS = 30 * 24 * 60 * 60 * 1000
 
@@ -66,6 +68,27 @@ export const loginPasswordSchema = z
     .refine((value) => value.trim().length > 0, {
         message: 'Password is required',
     })
+
+export const formPasswordSchema = z
+    .string()
+    .trim()
+    .min(10, 'Password must be at least 10 characters long')
+    .max(MAX_PASSWORD_LENGTH, `Password must be at most ${MAX_PASSWORD_LENGTH} characters long`)
+
+export const captchaTokenSchema = z
+    .string()
+    .trim()
+    .min(1, 'captcha_token is required')
+    .max(MAX_CAPTCHA_TOKEN_LENGTH, `captcha_token must be at most ${MAX_CAPTCHA_TOKEN_LENGTH} characters`)
+
+export const formAccessTokenSchema = z
+    .string()
+    .trim()
+    .min(1, 'X-Form-Access-Token header is required')
+    .max(
+        MAX_FORM_ACCESS_TOKEN_LENGTH,
+        `X-Form-Access-Token must be at most ${MAX_FORM_ACCESS_TOKEN_LENGTH} characters`
+    )
 
 export const optionalDisplayNameSchema = z.preprocess(
     trimToUndefined,
@@ -303,10 +326,20 @@ export const stripeCheckoutIdempotencyHeaderSchema = z.object({
 export const runnerSubmitBodySchema = z.object({
     data: z.record(z.string(), z.unknown()),
     started_at: startedAtSchema.optional(),
+    captcha_token: captchaTokenSchema.optional(),
 }).strict()
 
 export const runnerIdempotencyHeaderSchema = z.object({
     'idempotency-key': idempotencyHeaderSchema,
+}).strict()
+
+export const runnerAccessBodySchema = z.object({
+    password: formPasswordSchema,
+    captcha_token: captchaTokenSchema.optional(),
+}).strict()
+
+export const runnerFormAccessHeaderSchema = z.object({
+    'x-form-access-token': formAccessTokenSchema,
 }).strict()
 
 export const draftSchemaShape = z.object({
@@ -401,6 +434,28 @@ export const updateFormMetaSchema = z
         }
     )
 
+export const updateFormAccessSchema = z
+    .object({
+        version: z.number().int().min(1, 'version must be an integer >= 1'),
+        captcha_enabled: z.boolean().optional(),
+        password: formPasswordSchema.optional(),
+        clear_password: z.boolean().optional(),
+    })
+    .strict()
+    .refine((value) => !(value.password !== undefined && value.clear_password === true), {
+        message: 'password and clear_password cannot be provided together',
+        path: ['clear_password'],
+    })
+    .refine(
+        (value) =>
+            value.captcha_enabled !== undefined ||
+            value.password !== undefined ||
+            value.clear_password !== undefined,
+        {
+            message: 'At least one editable field must be provided',
+        }
+    )
+
 export const parseBearerAuthorizationHeader = (authorization: string | undefined) =>
     bearerAuthHeaderSchema.safeParse({ authorization })
 
@@ -408,6 +463,10 @@ export const parseInternalAdminAuthHeaders = (headers: {
     authorization?: string
     'x-internal-admin-token'?: string
 }) => internalAdminAuthHeaderSchema.safeParse(headers)
+
+export const parseRunnerFormAccessHeaders = (headers: {
+    'x-form-access-token'?: string
+}) => runnerFormAccessHeaderSchema.safeParse(headers)
 
 export const isAbsoluteHttpUrl = (value: string | undefined | null) =>
     typeof value === 'string' && absoluteHttpUrlSchema.safeParse(value).success
@@ -418,8 +477,11 @@ export type UpdateDraftInput = z.infer<typeof updateDraftSchema>
 export type PublishFormInput = z.infer<typeof publishFormSchema>
 export type CreateFormInput = z.infer<typeof createFormSchema>
 export type UpdateFormMetaInput = z.infer<typeof updateFormMetaSchema>
+export type UpdateFormAccessInput = z.infer<typeof updateFormAccessSchema>
 export type BuildSubmissionListQueryInput = z.infer<typeof buildSubmissionListQuerySchema>
 export type RunnerSubmitBodyInput = z.infer<typeof runnerSubmitBodySchema>
 export type RunnerIdempotencyHeaderInput = z.infer<typeof runnerIdempotencyHeaderSchema>
+export type RunnerAccessBodyInput = z.infer<typeof runnerAccessBodySchema>
+export type RunnerFormAccessHeaderInput = z.infer<typeof runnerFormAccessHeaderSchema>
 export type StripeCheckoutSessionInput = z.infer<typeof stripeCheckoutSessionSchema>
 export type StripeCheckoutIdempotencyHeaderInput = z.infer<typeof stripeCheckoutIdempotencyHeaderSchema>

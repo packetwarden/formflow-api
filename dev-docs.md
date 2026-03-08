@@ -279,6 +279,37 @@ Status mapping:
 5. `422` unsupported form schema (`UNSUPPORTED_FORM_SCHEMA`)
 6. `500` update/check failure
 
+### 8.5A PATCH `/api/v1/build/:workspaceId/forms/:formId/access`
+Purpose: update form password protection and Turnstile settings without exposing `password_hash`.
+
+Validation:
+1. `workspaceId` UUID
+2. `formId` UUID
+3. body schema (`updateFormAccessSchema`):
+   - required: `version`
+   - optional: `captcha_enabled`, `password`, `clear_password`
+   - `password` and `clear_password` cannot both be provided
+   - at least one editable field required
+
+Write behavior:
+1. requires editor-level workspace role
+2. setting/rotating password enforces entitlement `form_password`
+3. password values are bcrypt-hashed in the Worker before persistence
+4. `captcha_provider` is normalized to `turnstile` when enabled and `NULL` when disabled
+5. updates only when `forms.version = clientVersion`
+6. response is reloaded through a sanitized Worker path that returns:
+   - `captcha_enabled`
+   - `captcha_provider`
+   - `password_protected`
+   - never `password_hash`
+
+Status mapping:
+1. `200` updated
+2. `403` insufficient role or entitlement disabled
+3. `404` form not found
+4. `409` stale version conflict
+5. `500` update/check failure
+
 ### 8.6 POST `/api/v1/build/:workspaceId/forms/:formId/publish`
 Purpose: publish current draft as immutable version snapshot.
 
@@ -432,7 +463,7 @@ Response contract (`200`):
 1. `form.id`
 2. `form.title`
 3. `form.description`
-4. `form.published_schema`
+4. `form.published_schema` when the form is publicly accessible
 5. `form.success_message`
 6. `form.redirect_url`
 7. `form.meta_title`
@@ -440,15 +471,62 @@ Response contract (`200`):
 9. `form.meta_image_url`
 10. `form.captcha_enabled`
 11. `form.captcha_provider`
-12. `form.require_auth`
-13. `form.password_protected`
+12. `form.captcha_site_key` when captcha is enabled
+13. `form.require_auth`
+14. `form.password_protected`
+
+Locked response contract (`403 FORM_PASSWORD_REQUIRED`):
+1. no `published_schema`
+2. `form.id`
+3. `form.title`
+4. `form.description`
+5. `form.password_protected = true`
+6. `form.captcha_enabled`
+7. `form.captcha_provider`
+8. `form.captcha_site_key` when captcha is enabled
 
 Status mapping:
 1. `200` success
+2. `403` locked form requires password unlock
 2. `404` form not published/not visible/not open
 3. `500` RPC/db failure
 
-### 8A.2 POST `/api/v1/f/:formId/submit`
+### 8A.2 POST `/api/v1/f/:formId/access`
+Purpose: unlock a password-protected published form with optional Turnstile verification.
+
+Validation:
+1. `formId` UUID (`runnerFormParamSchema`)
+2. body schema (`runnerAccessBodySchema`)
+   - required: `password`
+   - optional: `captcha_token`
+3. request must resolve client IP for unlock rate limiting
+
+Execution flow:
+1. load form via `get_published_form_by_id`
+2. fail closed if `require_auth = true`
+3. enforce Worker-native password-attempt limiter (`RUNNER_PASSWORD_RATE_LIMITER`)
+4. if `captcha_enabled = true`, verify Turnstile with action `form_access`
+5. read `password_hash` via trusted backend client
+6. compare password using bcrypt
+7. issue short-lived HMAC-signed form access token scoped to:
+   - form id
+   - current form version
+   - expiry
+
+Success response contract (`200`):
+1. `access_token`
+2. `expires_at`
+
+Status mapping:
+1. `200` unlocked
+2. `400` invalid body shape or missing rate-limit IP context
+3. `403` protected-form failure (`FORM_AUTH_REQUIRED`, `FORM_PASSWORD_INVALID`, `CAPTCHA_REQUIRED`, `CAPTCHA_VERIFICATION_FAILED`)
+4. `404` form not found
+5. `409` password protection not enabled for the target form
+6. `429` password attempt rate-limited
+7. `500` internal failure
+
+### 8A.3 POST `/api/v1/f/:formId/submit`
 Purpose: submit a response using strict edge validation + DB atomic insert.
 
 Validation:
@@ -458,32 +536,34 @@ Validation:
 3. body schema (`runnerSubmitBodySchema`)
    - required: `data` object
    - optional: `started_at` ISO datetime (offset required, max 5 minutes future skew, max age 30 days)
+   - optional: `captcha_token`
+4. password-protected forms additionally require `X-Form-Access-Token`
 
 Execution flow:
 1. run `check_request()` RPC (strict rate-limit gate: 2 submissions per 60 seconds per anon IP)
 2. load form via `get_published_form_by_id`
-3. fail closed if published form requires unsupported protected-form features:
+3. fail closed if published form requires protected-form enforcement:
    - `require_auth = true` -> `403 FORM_AUTH_REQUIRED`
-   - `password_protected = true` -> `403 FORM_PASSWORD_REQUIRED`
-   - `captcha_enabled = true` -> `403 CAPTCHA_REQUIRED_UNSUPPORTED`
-4. parse `published_schema` into strict runner contract
-5. evaluate `logic[]` and compute visibility for submitted payload
-6. strip hidden field values from payload
-7. reject unknown keys not present in published field registry
-8. enforce strict field-level validation for visible fields
-9. normalize request metadata before trusted submit:
+   - `password_protected = true` and access token invalid/missing -> `403 FORM_ACCESS_TOKEN_INVALID`
+4. if `captcha_enabled = true`, verify Turnstile with action `form_submit`
+5. parse `published_schema` into strict runner contract
+6. evaluate `logic[]` and compute visibility for submitted payload
+7. strip hidden field values from payload
+8. reject unknown keys not present in published field registry
+9. enforce strict field-level validation for visible fields
+10. normalize request metadata before trusted submit:
    - invalid `referer` is dropped
    - blank/oversized `user-agent` is dropped
-10. enforce monthly entitlement with `get_form_submission_quota`
-11. build trusted submit client using `SUPABASE_SERVICE_ROLE_KEY`
+11. enforce monthly entitlement with `get_form_submission_quota`
+12. build trusted submit client using `SUPABASE_SERVICE_ROLE_KEY`
    - supported values: legacy JWT `service_role` or hosted `sb_secret_*`
    - hosted secret keys are sent through `apikey`; the shared client strips invalid `Authorization: Bearer <secret>` fallback when no explicit JWT is present
-12. call `submit_form` RPC with:
+13. call `submit_form` RPC with:
    - `p_form_id`
    - sanitized `p_data`
    - required `p_idempotency_key`
    - metadata passthrough (`p_ip_address`, `p_user_agent`, `p_referrer`, `p_started_at`)
-13. return completion payload for runner UX
+14. return completion payload for runner UX
 
 Strict validation contract:
 1. required field properties: `id`, `type`
@@ -512,7 +592,7 @@ Success response contract (`201`):
 Status mapping:
 1. `201` submission accepted
 2. `400` invalid header/body/param shape
-3. `403` protected form / entitlement blocked (`FORM_AUTH_REQUIRED`, `FORM_PASSWORD_REQUIRED`, `CAPTCHA_REQUIRED_UNSUPPORTED`, `PLAN_FEATURE_DISABLED`, `PLAN_LIMIT_EXCEEDED`)
+3. `403` protected form / captcha / entitlement blocked (`FORM_AUTH_REQUIRED`, `FORM_ACCESS_TOKEN_INVALID`, `CAPTCHA_REQUIRED`, `CAPTCHA_VERIFICATION_FAILED`, `PLAN_FEATURE_DISABLED`, `PLAN_LIMIT_EXCEEDED`)
 4. `404` form not found
 5. `409` form state conflict from `submit_form` RPC
 6. `422` strict schema or field validation failure (`UNSUPPORTED_FORM_SCHEMA`, `FIELD_VALIDATION_FAILED`)
@@ -520,14 +600,16 @@ Status mapping:
 8. `500` internal or RPC failure
    - privileged submit RPC auth/config failure returns `RUNNER_BACKEND_AUTH_MISCONFIGURED`
 
-### 8A.3 Submit Runtime Hardening (Post Dependency Upgrade)
+### 8A.4 Protected-Form Runtime Hardening
 Additional hardening in `src/routes/f/index.ts`:
 1. `parseStrictRateLimitError` safely parses non-standard RPC error payloads before status/code mapping.
-2. `/submit` handler is wrapped in a guarded `try/catch` and logs unhandled failures using:
+2. password unlock tokens are signed with HMAC-SHA256 and invalidated on form version bump.
+3. Turnstile verification is enforced server-side for both unlock and submit.
+4. `/submit` handler is wrapped in a guarded `try/catch` and logs unhandled failures using:
    - `console.error('Runner submit unhandled error:', error)`
-3. unhandled runtime failures now return deterministic JSON instead of opaque worker text-only 500:
+5. unhandled runtime failures now return deterministic JSON instead of opaque worker text-only 500:
    - `{ "error": "Failed to submit form", "code": "RUNNER_INTERNAL_ERROR" }`
-4. `@hono/zod-validator` remains in use for both route param and JSON body validation.
+6. `@hono/zod-validator` remains in use for route params and JSON bodies.
 
 ## 8B. Stripe Billing API v4 (Crash-Safe, Drift-Safe, Race-Hardened)
 Stripe router file: `src/routes/stripe/index.ts`
@@ -669,6 +751,18 @@ Shared form contract file: `src/utils/form-contract.ts`
 1. `parsePublishedContract(...)`
 2. `sanitizeAndValidateData(...)`
 
+Automated live validation script:
+1. `scripts/server-side-validation-check.mjs`
+2. run with `npm run test:validation:live`
+3. required env:
+   - `FORMSANDBOX_BASE_URL`
+   - `FORMSANDBOX_WORKSPACE_ID`
+   - either `FORMSANDBOX_ACCESS_TOKEN` or `FORMSANDBOX_EMAIL` + `FORMSANDBOX_PASSWORD`
+4. the script auto-creates and deletes a temporary form for build/runner coverage
+5. optional extra coverage:
+   - `FORMSANDBOX_RUN_PROTECTED_FORM_CHECKS=1`
+   - `FORMSANDBOX_RUN_STRIPE_CHECKS=1`
+
 ## 10. Database Contract Updates in V2
 Schema file: `project-info-docs/formflow_beta_schema_v2.sql`
 
@@ -755,6 +849,7 @@ Migration sources now folded into canonical V2 baseline:
 5. `project-info-docs/migrations/2026-02-25_stripe_billing_hardening_v2.sql`
 6. `project-info-docs/migrations/2026-02-26_stripe_customer_mapping_recovery_v3.sql`
 7. `project-info-docs/migrations/2026-02-26_stripe_incomplete_status_v4.sql`
+8. `project-info-docs/migrations/2026-03-07_cascade_soft_delete_security_definer_v1.sql`
 8. `project-info-docs/migrations/2026-02-27_runner_submission_gateway_hardening_v1.sql`
 9. `project-info-docs/migrations/2026-02-27_security_definer_hardening_v2.sql`
 10. `project-info-docs/migrations/2026-03-02_rls_initplan_wrapper_hardening_v1.sql`
@@ -788,6 +883,7 @@ Added:
 5. `project-info-docs/migrations/2026-02-25_stripe_billing_hardening_v2.sql`
 6. `project-info-docs/migrations/2026-02-26_stripe_customer_mapping_recovery_v3.sql`
 7. `project-info-docs/migrations/2026-02-26_stripe_incomplete_status_v4.sql`
+8. `project-info-docs/migrations/2026-03-07_cascade_soft_delete_security_definer_v1.sql`
 8. `project-info-docs/migrations/2026-02-27_runner_submission_gateway_hardening_v1.sql`
 9. `project-info-docs/migrations/2026-02-27_security_definer_hardening_v2.sql`
 10. `project-info-docs/migrations/2026-03-02_rls_initplan_wrapper_hardening_v1.sql`
@@ -825,6 +921,7 @@ For existing V1 environments:
 15. execute `project-info-docs/migrations/2026-03-07_runner_service_role_secret_key_compat_v1.sql`
 16. execute `project-info-docs/migrations/2026-03-07_build_submission_read_grants_v1.sql`
 17. verify function privileges, table/column grants hardening, search-path hardening, webhook lease reclaim, checkout idempotency, customer-recovery audit behavior, pending-payment status handling, RLS initplan wrapper predicates, implicit-free entitlement fallback, plan-cache trigger sync, stale-event watermark behavior, and reconciliation RPC behavior
+18. verify builder soft-delete succeeds after applying `2026-03-07_cascade_soft_delete_security_definer_v1.sql`
 
 Emergency rollback (Stripe v2 -> Stripe v1):
 1. roll back backend code to the last Stripe v1 git revision

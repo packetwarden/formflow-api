@@ -7,7 +7,8 @@ Target: Cloudflare Worker deployment (`/api/v1/f/*`)
 ## 1. Scope
 This guide covers public runner endpoint testing only:
 1. `GET /api/v1/f/:formId/schema`
-2. `POST /api/v1/f/:formId/submit`
+2. `POST /api/v1/f/:formId/access`
+3. `POST /api/v1/f/:formId/submit`
 
 This guide validates:
 1. strict fail-closed schema contract enforcement
@@ -106,7 +107,8 @@ pm.test("Response is JSON when body exists", function () {
 ## 6. Endpoint Matrix
 | Method | Endpoint | Auth | Expected |
 |---|---|---|---|
-| GET | `/api/v1/f/:formId/schema` | No | `200` / `404` / `500` |
+| GET | `/api/v1/f/:formId/schema` | No | `200` / `403` / `404` / `500` |
+| POST | `/api/v1/f/:formId/access` | No | `200` / `400` / `403` / `404` / `409` / `429` / `500` |
 | POST | `/api/v1/f/:formId/submit` | No + `Idempotency-Key` | `201` / `400` / `403` / `404` / `409` / `422` / `429` / `500` |
 
 ## 7. Detailed Postman Requests
@@ -438,17 +440,20 @@ Use `form_id_valid` and mutate one field per request.
 11. Entitlement disabled -> `403 PLAN_FEATURE_DISABLED`
 12. Entitlement exceeded -> `403 PLAN_LIMIT_EXCEEDED`
 13. Published form with `require_auth = true` -> `403 FORM_AUTH_REQUIRED`
-14. Published form with password enabled -> `403 FORM_PASSWORD_REQUIRED`
-15. Published form with `captcha_enabled = true` -> `403 CAPTCHA_REQUIRED_UNSUPPORTED`
-16. `started_at` more than 5 minutes in the future -> `400`
-17. `started_at` older than 30 days -> `400`
-18. Invalid `referer` header is ignored and submit still succeeds when all other inputs are valid
-19. Backend submit client misconfigured -> `500 RUNNER_BACKEND_AUTH_MISCONFIGURED`
-20. Burst submissions -> `429`
-21. Direct Supabase Data API `INSERT` to `public.form_submissions` with anon key -> blocked (`401/403`)
-22. Direct Supabase RPC `submit_form` call with anon key -> blocked (`401/403`)
-23. Direct Supabase RPC `get_workspace_entitlements(UUID)` with anon key -> blocked (`401/403`)
-24. Direct Supabase RPC `check_request()` with authenticated key -> blocked (`401/403`)
+14. Locked schema fetch without access token -> `403 FORM_PASSWORD_REQUIRED`
+15. Password unlock with wrong password -> `403 FORM_PASSWORD_INVALID`
+16. Password-protected submit without `X-Form-Access-Token` -> `403 FORM_ACCESS_TOKEN_INVALID`
+17. Captcha-enabled unlock/submit without `captcha_token` -> `403 CAPTCHA_REQUIRED`
+18. Captcha-enabled unlock/submit with invalid Turnstile token -> `403 CAPTCHA_VERIFICATION_FAILED`
+19. `started_at` more than 5 minutes in the future -> `400`
+20. `started_at` older than 30 days -> `400`
+21. Invalid `referer` header is ignored and submit still succeeds when all other inputs are valid
+22. Backend submit client misconfigured -> `500 RUNNER_BACKEND_AUTH_MISCONFIGURED`
+23. Burst submissions -> `429`
+24. Direct Supabase Data API `INSERT` to `public.form_submissions` with anon key -> blocked (`401/403`)
+25. Direct Supabase RPC `submit_form` call with anon key -> blocked (`401/403`)
+26. Direct Supabase RPC `get_workspace_entitlements(UUID)` with anon key -> blocked (`401/403`)
+27. Direct Supabase RPC `check_request()` with authenticated key -> blocked (`401/403`)
 
 ### 9.1 Security SQL Audit Snippets
 Search-path hardening audit (expect zero rows):

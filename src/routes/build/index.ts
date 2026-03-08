@@ -1,6 +1,8 @@
 import { Hono } from 'hono'
 import { zValidator } from '@hono/zod-validator'
+import { hash } from 'bcryptjs'
 import type { Env, Variables } from '../../types'
+import { getServiceRoleSupabaseClient } from '../../db/supabase'
 import { requireAuth } from '../../middlewares/auth'
 import { buildWriteRateLimit } from '../../middlewares/rate-limit'
 import {
@@ -17,6 +19,7 @@ import {
     createFormSchema,
     publishFormSchema,
     updateDraftSchema,
+    updateFormAccessSchema,
     updateFormMetaSchema,
     workspaceParamSchema,
 } from '../../utils/validation'
@@ -35,6 +38,12 @@ type SubmissionListRow = Record<string, unknown> & {
     created_at: string
 }
 
+type FormRow = Record<string, unknown> & {
+    password_hash?: string | null
+    captcha_enabled?: boolean | null
+    captcha_provider?: string | null
+}
+
 const formSummarySelect = [
     'id',
     'workspace_id',
@@ -51,9 +60,13 @@ const formSummarySelect = [
     'accept_submissions',
     'success_message',
     'redirect_url',
+    'captcha_enabled',
+    'captcha_provider',
 ].join(', ')
 
+const formSummaryWithAccessSelect = `${formSummarySelect}, password_hash`
 const formDetailSelect = `${formSummarySelect}, schema`
+const formDetailWithAccessSelect = `${formDetailSelect}, password_hash`
 
 const submissionListSelect = [
     'id',
@@ -83,6 +96,8 @@ buildRouter.use('*', requireAuth)
 buildRouter.use('*', buildWriteRateLimit)
 
 const getScopedSupabaseClient = getAuthScopedSupabaseClient
+const getServiceRoleSupabase = (c: BuildContext) =>
+    getServiceRoleSupabaseClient(c.env.SUPABASE_URL, c.env.SUPABASE_SERVICE_ROLE_KEY)
 
 const normalizeSlugBase = (title: string) => {
     const asciiTitle = title.normalize('NFKD').replace(/[\u0300-\u036f]/g, '')
@@ -223,6 +238,82 @@ const validateDraftContract = (schema: unknown) => {
     return contractResult.ok ? null : contractResult.issues
 }
 
+const getPasswordHashCost = (env: Env) => {
+    const parsed = Number(env.FORM_PASSWORD_BCRYPT_COST ?? 12)
+    if (!Number.isFinite(parsed)) return 12
+    return Math.min(14, Math.max(10, Math.floor(parsed)))
+}
+
+const sanitizeFormResponse = <T extends FormRow>(form: T) => {
+    const { password_hash, ...safeForm } = form
+    const captchaEnabled = form.captcha_enabled ?? false
+
+    return {
+        ...safeForm,
+        captcha_enabled: captchaEnabled,
+        captcha_provider: captchaEnabled ? form.captcha_provider ?? 'turnstile' : null,
+        password_protected: Boolean(password_hash),
+    }
+}
+
+const fetchFormForResponse = async (c: BuildContext, workspaceId: string, formId: string) => {
+    const supabase = getServiceRoleSupabase(c)
+    const { data: form, error } = await supabase
+        .from('forms')
+        .select(formDetailWithAccessSelect)
+        .eq('id', formId)
+        .eq('workspace_id', workspaceId)
+        .is('deleted_at', null)
+        .maybeSingle()
+
+    if (error) {
+        console.error('Build form response fetch error:', error)
+        return { ok: false as const, response: c.json({ error: 'Failed to fetch form' }, 500) }
+    }
+
+    if (!form) {
+        return { ok: false as const, response: c.json({ error: 'Form not found' }, 404) }
+    }
+
+    return { ok: true as const, form: sanitizeFormResponse(form as unknown as FormRow) }
+}
+
+const checkPasswordEntitlement = async (c: BuildContext, workspaceId: string) => {
+    const supabase = getScopedSupabaseClient(c)
+
+    const { data: entitlementData, error: entitlementError } = await supabase.rpc(
+        'get_workspace_entitlements',
+        {
+            p_workspace_id: workspaceId,
+        }
+    )
+
+    if (entitlementError) {
+        console.error('Build password entitlement fetch error:', entitlementError)
+        return { ok: false as const, response: c.json({ error: 'Failed to check workspace entitlements' }, 500) }
+    }
+
+    const passwordEntitlement = (entitlementData as EntitlementRow[] | null)?.find(
+        (entry) => entry.feature_key === 'form_password'
+    )
+
+    if (passwordEntitlement?.is_enabled) {
+        return { ok: true as const }
+    }
+
+    return {
+        ok: false as const,
+        response: c.json({
+            error: 'Feature disabled for current plan',
+            code: 'PLAN_FEATURE_DISABLED',
+            feature: 'form_password',
+            current: null,
+            allowed: passwordEntitlement?.limit_value ?? null,
+            upgrade_url: '/pricing',
+        }, 403),
+    }
+}
+
 /**
  * GET /api/v1/build/:workspaceId/forms
  * Returns forms for the workspace with summary metadata.
@@ -235,10 +326,10 @@ buildRouter.get(
         const access = await checkWorkspaceAccess(c, workspaceId)
         if (!access.ok) return access.response
 
-        const supabase = getScopedSupabaseClient(c)
+        const supabase = getServiceRoleSupabase(c)
         const { data: forms, error } = await supabase
             .from('forms')
-            .select(formSummarySelect)
+            .select(formSummaryWithAccessSelect)
             .eq('workspace_id', workspaceId)
             .is('deleted_at', null)
             .order('updated_at', { ascending: false })
@@ -248,7 +339,9 @@ buildRouter.get(
             return c.json({ error: 'Failed to fetch forms' }, 500)
         }
 
-        return c.json({ forms: forms ?? [] }, 200)
+        return c.json({
+            forms: (forms ?? []).map((form) => sanitizeFormResponse(form as unknown as FormRow)),
+        }, 200)
     }
 )
 
@@ -306,11 +399,13 @@ buildRouter.post(
             const { data: createdForm, error: createError } = await supabase
                 .from('forms')
                 .insert(createPayload)
-                .select(formDetailSelect)
+                .select('id')
                 .maybeSingle()
 
             if (!createError && createdForm) {
-                return c.json({ form: createdForm }, 201)
+                const formResponse = await fetchFormForResponse(c, workspaceId, createdForm.id)
+                if (!formResponse.ok) return formResponse.response
+                return c.json({ form: formResponse.form }, 201)
             }
 
             if (createError?.code === '23505') {
@@ -334,11 +429,13 @@ buildRouter.get(
     zValidator('param', buildParamSchema),
     async (c) => {
         const { workspaceId, formId } = c.req.valid('param')
-        const supabase = getScopedSupabaseClient(c)
+        const access = await checkWorkspaceAccess(c, workspaceId)
+        if (!access.ok) return access.response
 
+        const supabase = getServiceRoleSupabase(c)
         const { data: form, error } = await supabase
             .from('forms')
-            .select(formDetailSelect)
+            .select(formDetailWithAccessSelect)
             .eq('id', formId)
             .eq('workspace_id', workspaceId)
             .is('deleted_at', null)
@@ -353,7 +450,7 @@ buildRouter.get(
             return c.json({ error: 'Form not found' }, 404)
         }
 
-        return c.json({ form }, 200)
+        return c.json({ form: sanitizeFormResponse(form as unknown as FormRow) }, 200)
     }
 )
 
@@ -496,7 +593,7 @@ buildRouter.patch(
             .eq('workspace_id', workspaceId)
             .eq('version', version)
             .is('deleted_at', null)
-            .select(formDetailSelect)
+            .select('id')
             .maybeSingle()
 
         if (updateError) {
@@ -505,7 +602,9 @@ buildRouter.patch(
         }
 
         if (updatedForm) {
-            return c.json({ form: updatedForm }, 200)
+            const formResponse = await fetchFormForResponse(c, workspaceId, formId)
+            if (!formResponse.ok) return formResponse.response
+            return c.json({ form: formResponse.form }, 200)
         }
 
         const { data: existingForm, error: checkError } = await supabase
@@ -562,7 +661,7 @@ buildRouter.put(
             .eq('workspace_id', workspaceId)
             .eq('version', version)
             .is('deleted_at', null)
-            .select(formDetailSelect)
+            .select('id')
             .maybeSingle()
 
         if (updateError) {
@@ -571,7 +670,9 @@ buildRouter.put(
         }
 
         if (updatedForm) {
-            return c.json({ form: updatedForm }, 200)
+            const formResponse = await fetchFormForResponse(c, workspaceId, formId)
+            if (!formResponse.ok) return formResponse.response
+            return c.json({ form: formResponse.form }, 200)
         }
 
         const { data: existingForm, error: checkError } = await supabase
@@ -584,6 +685,90 @@ buildRouter.put(
 
         if (checkError) {
             console.error('Build form stale-check error:', checkError)
+            return c.json({ error: 'Failed to verify form state' }, 500)
+        }
+
+        if (!existingForm) {
+            return c.json({ error: 'Form not found' }, 404)
+        }
+
+        return c.json({
+            error: 'Version conflict',
+            current_version: existingForm.version,
+        }, 409)
+    }
+)
+
+/**
+ * PATCH /api/v1/build/:workspaceId/forms/:formId/access
+ * Updates form access controls with optimistic locking.
+ */
+buildRouter.patch(
+    '/:workspaceId/forms/:formId/access',
+    zValidator('param', buildParamSchema),
+    zValidator('json', updateFormAccessSchema),
+    async (c) => {
+        const { workspaceId, formId } = c.req.valid('param')
+        const { version, captcha_enabled, password, clear_password } = c.req.valid('json')
+
+        const workspaceRole = await enforceWorkspaceRole(c, workspaceId, 'editor')
+        if (!workspaceRole.ok) return workspaceRole.response
+
+        if (password !== undefined) {
+            const entitlement = await checkPasswordEntitlement(c, workspaceId)
+            if (!entitlement.ok) return entitlement.response
+        }
+
+        const updates: Record<string, unknown> = {
+            version: version + 1,
+        }
+
+        if (captcha_enabled !== undefined) {
+            updates.captcha_enabled = captcha_enabled
+            updates.captcha_provider = captcha_enabled ? 'turnstile' : null
+        }
+
+        if (password !== undefined) {
+            updates.password_hash = await hash(password, getPasswordHashCost(c.env))
+        }
+
+        if (clear_password === true) {
+            updates.password_hash = null
+        }
+
+        const supabase = getServiceRoleSupabase(c)
+        const { data: updatedForm, error: updateError } = await supabase
+            .from('forms')
+            .update(updates)
+            .eq('id', formId)
+            .eq('workspace_id', workspaceId)
+            .eq('version', version)
+            .is('deleted_at', null)
+            .select('id')
+            .maybeSingle()
+
+        if (updateError) {
+            console.error('Build form access update error:', updateError)
+            return c.json({ error: 'Failed to update form access' }, 500)
+        }
+
+        if (updatedForm) {
+            const formResponse = await fetchFormForResponse(c, workspaceId, formId)
+            if (!formResponse.ok) return formResponse.response
+            return c.json({ form: formResponse.form }, 200)
+        }
+
+        const scopedSupabase = getScopedSupabaseClient(c)
+        const { data: existingForm, error: checkError } = await scopedSupabase
+            .from('forms')
+            .select('id, version')
+            .eq('id', formId)
+            .eq('workspace_id', workspaceId)
+            .is('deleted_at', null)
+            .maybeSingle()
+
+        if (checkError) {
+            console.error('Build form access stale-check error:', checkError)
             return c.json({ error: 'Failed to verify form state' }, 500)
         }
 

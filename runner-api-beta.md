@@ -1,7 +1,7 @@
 # Runner API v1 (Beta) - Developer Deep Dive
 
-Version: 1.2  
-Last Updated: February 23, 2026  
+Version: 1.3  
+Last Updated: March 8, 2026  
 Owner: Backend Platform Team
 
 ## 1. Purpose
@@ -36,6 +36,7 @@ Success response (`200`):
     "meta_image_url": "string|null",
     "captcha_enabled": true,
     "captcha_provider": "string|null",
+    "captcha_site_key": "string|null",
     "require_auth": false,
     "password_protected": false
   }
@@ -44,20 +45,51 @@ Success response (`200`):
 
 Status mapping:
 1. `200` success
-2. `404` form not published/not visible/not within schedule window
-3. `500` backend/RPC error
+2. `403 FORM_PASSWORD_REQUIRED` for locked password-protected forms (no `published_schema` returned)
+3. `404` form not published/not visible/not within schedule window
+4. `500` backend/RPC error
 
-### 2.2 POST `/api/v1/f/:formId/submit`
+### 2.2 POST `/api/v1/f/:formId/access`
+Unlocks a password-protected published form and returns a short-lived form access token.
+
+Request body:
+```json
+{
+  "password": "form secret",
+  "captcha_token": "optional-turnstile-token"
+}
+```
+
+Success response (`200`):
+```json
+{
+  "access_token": "opaque-signed-token",
+  "expires_at": "2026-03-08T15:30:00.000Z"
+}
+```
+
+Status mapping:
+1. `200` success
+2. `400` invalid body or missing client IP context
+3. `403` protected-form failure (`FORM_AUTH_REQUIRED`, `FORM_PASSWORD_INVALID`, `CAPTCHA_REQUIRED`, `CAPTCHA_VERIFICATION_FAILED`)
+4. `404` form not found/unavailable
+5. `409` password protection not enabled
+6. `429` password-attempt rate limit
+7. `500` unexpected backend error
+
+### 2.3 POST `/api/v1/f/:formId/submit`
 Processes public submission with strict validation, logic-aware sanitization, quota checks, rate limiting, and idempotent persistence.
 
 Headers:
 1. required `Idempotency-Key` UUID
+2. `X-Form-Access-Token` for password-protected forms
 
 Body:
 ```json
 {
   "data": { "field_id": "value" },
-  "started_at": "2026-02-23T10:30:00Z"
+  "started_at": "2026-02-23T10:30:00Z",
+  "captcha_token": "optional-turnstile-token"
 }
 ```
 
@@ -75,7 +107,7 @@ Success response (`201`):
 Status mapping:
 1. `201` success
 2. `400` invalid params/headers/body
-3. `403` entitlement blocked (`PLAN_FEATURE_DISABLED`, `PLAN_LIMIT_EXCEEDED`)
+3. `403` protected-form/captcha/entitlement blocked (`FORM_AUTH_REQUIRED`, `FORM_ACCESS_TOKEN_INVALID`, `CAPTCHA_REQUIRED`, `CAPTCHA_VERIFICATION_FAILED`, `PLAN_FEATURE_DISABLED`, `PLAN_LIMIT_EXCEEDED`)
 4. `404` form not found/unavailable
 5. `409` form state conflict from submit RPC
 6. `422` strict schema/field validation failure (`UNSUPPORTED_FORM_SCHEMA`, `FIELD_VALIDATION_FAILED`)
@@ -88,16 +120,18 @@ Submit path sequence:
 2. build anon Supabase client with forwarded request headers (`x-forwarded-for`, `user-agent`, `referer`)
 3. call `public.check_request()` (strict DB rate-limit gate: 2 submissions per 60 seconds per anon IP)
 4. load form with `public.get_published_form_by_id(formId)`
-5. parse/normalize `published_schema` into strict runtime contract
-6. evaluate logic (`show`/`hide`) and compute visibility state
-7. strip hidden submitted fields
-8. reject unknown keys and validate visible field values
-9. enforce monthly entitlement with `public.get_form_submission_quota(formId)`
-10. build trusted submit client using `SUPABASE_SERVICE_ROLE_KEY`
+5. if password protected, require valid signed access token bound to `form_id` + current `form.version`
+6. if captcha enabled, verify Turnstile token with action `form_submit`
+7. parse/normalize `published_schema` into strict runtime contract
+8. evaluate logic (`show`/`hide`) and compute visibility state
+9. strip hidden submitted fields
+10. reject unknown keys and validate visible field values
+11. enforce monthly entitlement with `public.get_form_submission_quota(formId)`
+12. build trusted submit client using `SUPABASE_SERVICE_ROLE_KEY`
    - supported values: legacy JWT `service_role` or hosted `sb_secret_*`
    - when the backend key is non-JWT (`sb_secret_*`), the shared client keeps `apikey` auth and strips invalid `Authorization: Bearer <secret>` fallback
-11. execute `public.submit_form(...)` with sanitized payload and metadata
-12. return `submission_id` + completion settings
+13. execute `public.submit_form(...)` with sanitized payload and metadata
+14. return `submission_id` + completion settings
 
 ## 4. Strict Schema Contract
 ### 4.1 Supported Field Types
@@ -187,12 +221,14 @@ Field id aliases:
 ## 6. Security Model and Failure Rationale
 Defense layers:
 1. strict edge validation and contract parsing
-2. logic-aware sanitization to remove hidden-field injection attempts
-3. strict DB-backed rate-limit gate (`check_request`)
-4. DB-backed entitlement guard (`get_form_submission_quota`)
-5. strict gateway write path: only Worker trusted submit client can execute `submit_form`
-6. atomic idempotent write path (`submit_form`)
-7. hosted `sb_secret_*` backend keys are supported without weakening the DB privilege model
+2. password-protected schema gating with short-lived HMAC-signed access tokens
+3. server-side Turnstile verification on unlock and submit
+4. logic-aware sanitization to remove hidden-field injection attempts
+5. strict DB-backed rate-limit gate (`check_request`)
+6. DB-backed entitlement guard (`get_form_submission_quota`)
+7. strict gateway write path: only Worker trusted submit client can execute `submit_form`
+8. atomic idempotent write path (`submit_form`)
+9. hosted `sb_secret_*` backend keys are supported without weakening the DB privilege model
 
 Failure-mode rationale:
 1. public endpoint receives untrusted traffic
@@ -281,5 +317,5 @@ Primary test document:
 1. Stripe webhook route (`/api/v1/stripe/webhook`) remains pending in beta.
 2. advanced field types outside explicit beta contract remain intentionally blocked.
 3. advanced logic action semantics beyond show/hide remain deferred.
-4. captcha verification pipeline is not yet enforced in submit path.
+4. protected-form enforcement is now active for password + Turnstile flows.
 5. optional plan-lookup caching (KV/DO) is deferred; quota checks are DB-backed per request.

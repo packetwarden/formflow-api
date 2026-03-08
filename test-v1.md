@@ -15,12 +15,14 @@ This guide covers testing core API routes:
 7. `POST /api/v1/build/:workspaceId/forms`
 8. `GET /api/v1/build/:workspaceId/forms/:formId`
 9. `PATCH /api/v1/build/:workspaceId/forms/:formId`
-10. `PUT /api/v1/build/:workspaceId/forms/:formId`
-11. `POST /api/v1/build/:workspaceId/forms/:formId/publish`
-12. `DELETE /api/v1/build/:workspaceId/forms/:formId`
-13. `GET /api/v1/f/:formId/schema`
-14. `POST /api/v1/f/:formId/submit`
-15. `POST /api/v1/stripe/workspaces/:workspaceId/checkout-session`
+10. `PATCH /api/v1/build/:workspaceId/forms/:formId/access`
+11. `PUT /api/v1/build/:workspaceId/forms/:formId`
+12. `POST /api/v1/build/:workspaceId/forms/:formId/publish`
+13. `DELETE /api/v1/build/:workspaceId/forms/:formId`
+14. `GET /api/v1/f/:formId/schema`
+15. `POST /api/v1/f/:formId/access`
+16. `POST /api/v1/f/:formId/submit`
+17. `POST /api/v1/stripe/workspaces/:workspaceId/checkout-session`
 
 Stripe billing has a dedicated deep-dive matrix in `test-stripe-v1.md`.
 
@@ -57,6 +59,41 @@ Create a Postman environment with these variables:
 | `form_version` | integer | Yes (for update tests) |
 | `user_id` | UUID | Optional |
 | `viewer_access_token` | JWT | Optional (permission negative tests) |
+
+## 3A. Automated Live Validation Script
+An automated integration check is available:
+1. Script: `scripts/server-side-validation-check.mjs`
+2. Package command: `npm run test:validation:live`
+
+Required environment variables:
+1. `FORMSANDBOX_BASE_URL`
+2. `FORMSANDBOX_WORKSPACE_ID`
+3. either:
+   - `FORMSANDBOX_ACCESS_TOKEN`
+   - or `FORMSANDBOX_EMAIL` + `FORMSANDBOX_PASSWORD`
+
+Default script behavior:
+1. logs in if needed
+2. checks `/`
+3. checks `/api/v1/auth/me`
+4. creates a temporary builder form automatically
+5. verifies build validation failures (`422`, invalid redirect `400`)
+6. publishes the temporary form
+7. verifies runner validation failures and a successful submit
+8. deletes the temporary form unless `FORMSANDBOX_KEEP_ARTIFACTS=1`
+
+Optional protected-form checks:
+1. set `FORMSANDBOX_RUN_PROTECTED_FORM_CHECKS=1`
+2. also set:
+   - `FORMSANDBOX_REQUIRE_AUTH_FORM_ID`
+   - `FORMSANDBOX_PASSWORD_PROTECTED_FORM_ID`
+   - `FORMSANDBOX_CAPTCHA_FORM_ID`
+
+Optional Stripe checks:
+1. set `FORMSANDBOX_RUN_STRIPE_CHECKS=1`
+2. also set:
+   - `FORMSANDBOX_STRIPE_WORKSPACE_ID`
+   - `FORMSANDBOX_INTERNAL_ADMIN_TOKEN`
 
 ## 4. Getting `workspace_id` and Optional Viewer Setup
 Find workspace ID for your user:
@@ -102,10 +139,12 @@ pm.test("Status is not 401", function () {
 | POST | `/api/v1/build/:workspaceId/forms` | Yes | `201` / `403` / `404` / `422` |
 | GET | `/api/v1/build/:workspaceId/forms/:formId` | Yes | `200` / `404` |
 | PATCH | `/api/v1/build/:workspaceId/forms/:formId` | Yes | `200` / `403` / `404` / `409` |
+| PATCH | `/api/v1/build/:workspaceId/forms/:formId/access` | Yes | `200` / `403` / `404` / `409` |
 | PUT | `/api/v1/build/:workspaceId/forms/:formId` | Yes | `200` / `403` / `404` / `409` / `422` |
 | POST | `/api/v1/build/:workspaceId/forms/:formId/publish` | Yes | `200` / `403` / `404` / `422` |
 | DELETE | `/api/v1/build/:workspaceId/forms/:formId` | Yes | `200` / `403` / `404` |
-| GET | `/api/v1/f/:formId/schema` | No | `200` / `400` / `404` |
+| GET | `/api/v1/f/:formId/schema` | No | `200` / `400` / `403` / `404` |
+| POST | `/api/v1/f/:formId/access` | No | `200` / `400` / `403` / `404` / `409` / `429` |
 | POST | `/api/v1/f/:formId/submit` | No (`Idempotency-Key` required) | `201` / `400` / `403` / `404` / `409` / `422` / `429` / `500` |
 | POST | `/api/v1/stripe/workspaces/:workspaceId/checkout-session` | Yes (`Idempotency-Key` required) | `200` / `400` / `403` / `404` / `409` / `500` |
 
@@ -379,10 +418,12 @@ Expected:
 16. PUT draft with unsupported schema field type/operator/action -> `422 UNSUPPORTED_FORM_SCHEMA`
 17. Publish invalid draft contract -> `422 UNSUPPORTED_FORM_SCHEMA`
 18. Runner submit against published form with `require_auth = true` -> `403 FORM_AUTH_REQUIRED`
-19. Runner submit against published form with password enabled -> `403 FORM_PASSWORD_REQUIRED`
-20. Runner submit against published form with `captcha_enabled = true` -> `403 CAPTCHA_REQUIRED_UNSUPPORTED`
-21. Signup/login with uppercase email succeeds and stored request email is normalized lowercase
-22. Malformed `Authorization` header on `/auth/me` or `/auth/logout` -> `401`
+19. Locked schema fetch without access token -> `403 FORM_PASSWORD_REQUIRED`
+20. Runner submit against password-protected form without valid unlock token -> `403 FORM_ACCESS_TOKEN_INVALID`
+21. Captcha-enabled unlock/submit without token -> `403 CAPTCHA_REQUIRED`
+22. Captcha-enabled unlock/submit with invalid token -> `403 CAPTCHA_VERIFICATION_FAILED`
+23. Signup/login with uppercase email succeeds and stored request email is normalized lowercase
+24. Malformed `Authorization` header on `/auth/me` or `/auth/logout` -> `401`
 
 ### 8.1 Security SQL Audit Snippets
 Search-path hardening audit (expect zero rows):
@@ -446,7 +487,9 @@ Expected create response:
 5. Runner protected-form fail-closed codes:
    - `FORM_AUTH_REQUIRED`
    - `FORM_PASSWORD_REQUIRED`
-   - `CAPTCHA_REQUIRED_UNSUPPORTED`
+   - `FORM_ACCESS_TOKEN_INVALID`
+   - `CAPTCHA_REQUIRED`
+   - `CAPTCHA_VERIFICATION_FAILED`
 6. For full Stripe scenarios (webhooks, lease reclaim, drift sync, race tests), run `test-stripe-v1.md`.
 7. Runner write path is strict-gateway only: direct anon Data API inserts to `public.form_submissions` and direct anon `submit_form` RPC calls are expected to fail.
 
