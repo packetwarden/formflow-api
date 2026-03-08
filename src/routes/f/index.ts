@@ -52,7 +52,7 @@ type QuotaRow = {
     workspace_id: string
 }
 
-const PASSWORD_RATE_LIMIT_RETRY_AFTER_SECONDS = 10 * 60
+const PASSWORD_RATE_LIMIT_RETRY_AFTER_SECONDS = 60
 
 const isRecord = (value: unknown): value is Record<string, unknown> => {
     return typeof value === 'object' && value !== null && !Array.isArray(value)
