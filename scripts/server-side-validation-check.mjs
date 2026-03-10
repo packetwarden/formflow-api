@@ -13,6 +13,7 @@ const config = {
     requireAuthFormId: env.FORMSANDBOX_REQUIRE_AUTH_FORM_ID ?? '',
     passwordProtectedFormId: env.FORMSANDBOX_PASSWORD_PROTECTED_FORM_ID ?? '',
     captchaFormId: env.FORMSANDBOX_CAPTCHA_FORM_ID ?? '',
+    tempFormPassword: env.FORMSANDBOX_TEMP_FORM_PASSWORD ?? 'TempFormPassword123!',
     runStripeChecks: env.FORMSANDBOX_RUN_STRIPE_CHECKS === '1',
     stripeWorkspaceId: env.FORMSANDBOX_STRIPE_WORKSPACE_ID ?? '',
     internalAdminToken: env.FORMSANDBOX_INTERNAL_ADMIN_TOKEN ?? '',
@@ -274,6 +275,23 @@ async function createTempForm(token) {
     }
 }
 
+async function patchFormAccess(token, formId, payload) {
+    const { response, body } = await request(`/api/v1/build/${config.workspaceId}/forms/${formId}/access`, {
+        method: 'PATCH',
+        headers: {
+            ...authHeaders(token),
+            'Content-Type': 'application/json',
+        },
+        body: JSON.stringify(payload),
+    })
+
+    if (response.status !== 200 || !body?.form?.version) {
+        fail('Patch form access', response, `expected 200, body=${JSON.stringify(body)}`)
+    }
+
+    return body.form
+}
+
 async function deleteForm(token, formId) {
     const { response, body } = await request(`/api/v1/build/${config.workspaceId}/forms/${formId}`, {
         method: 'DELETE',
@@ -393,7 +411,10 @@ async function runBuildChecks(token) {
     }
     logPass('Publish temp form')
 
-    return form.id
+    return {
+        id: form.id,
+        version: validPut.body.form.version,
+    }
 }
 
 async function submitRunnerForm(formId, payload, headers = {}) {
@@ -407,13 +428,32 @@ async function submitRunnerForm(formId, payload, headers = {}) {
     })
 }
 
-async function runRunnerChecks(formId) {
+async function requestRunnerFormAccess(formId, payload) {
+    return request(`/api/v1/f/${formId}/access`, {
+        method: 'POST',
+        headers: {
+            'Content-Type': 'application/json',
+        },
+        body: JSON.stringify(payload),
+    })
+}
+
+async function fetchRunnerSchema(formId, headers = {}) {
+    return request(`/api/v1/f/${formId}/schema`, {
+        headers,
+    })
+}
+
+async function runRunnerChecks(token, form) {
     logSection('Runner')
 
-    await expectStatus('Runner schema fetch', `/api/v1/f/${formId}/schema`, 200)
-    logPass('Runner schema fetch', `form_id=${formId}`)
+    const schema = await fetchRunnerSchema(form.id)
+    if (schema.response.status !== 200) {
+        fail('Runner schema fetch', schema.response, `expected 200, body=${JSON.stringify(schema.body)}`)
+    }
+    logPass('Runner schema fetch', `form_id=${form.id}`)
 
-    const missingIdempotency = await submitRunnerForm(formId, {
+    const missingIdempotency = await submitRunnerForm(form.id, {
         data: {
             email: 'qa.runner@example.com',
             full_name: 'Runner QA',
@@ -429,7 +469,7 @@ async function runRunnerChecks(formId) {
     logPass('Runner missing idempotency rejected')
 
     const futureStartedAt = new Date(Date.now() + (10 * 60 * 1000)).toISOString()
-    const invalidStartedAt = await submitRunnerForm(formId, {
+    const invalidStartedAt = await submitRunnerForm(form.id, {
         data: {
             email: 'qa.runner@example.com',
             full_name: 'Runner QA',
@@ -447,8 +487,66 @@ async function runRunnerChecks(formId) {
     }
     logPass('Runner future started_at rejected')
 
+    let currentVersion = form.version
+
+    const protectedForm = await patchFormAccess(token, form.id, {
+        version: currentVersion,
+        password: config.tempFormPassword,
+    })
+    currentVersion = protectedForm.version
+    logPass('Builder set form password', `version=${currentVersion}`)
+
+    const lockedSchema = await fetchRunnerSchema(form.id)
+    if (lockedSchema.response.status !== 403 || lockedSchema.body?.code !== 'FORM_PASSWORD_REQUIRED') {
+        fail('Runner locked schema', lockedSchema.response, `body=${JSON.stringify(lockedSchema.body)}`)
+    }
+    if (lockedSchema.body?.form?.published_schema !== undefined) {
+        throw new Error('Locked schema response exposed published_schema')
+    }
+    logPass('Runner locked schema')
+
+    const missingCaptcha = await requestRunnerFormAccess(form.id, {
+        password: config.tempFormPassword,
+    })
+    if (missingCaptcha.response.status !== 403 || missingCaptcha.body?.code !== 'CAPTCHA_REQUIRED') {
+        fail('Runner access missing captcha rejected', missingCaptcha.response, `body=${JSON.stringify(missingCaptcha.body)}`)
+    }
+    logPass('Runner access missing captcha rejected')
+
+    const captchaDisabledForm = await patchFormAccess(token, form.id, {
+        version: currentVersion,
+        captcha_enabled: false,
+    })
+    currentVersion = captchaDisabledForm.version
+    logPass('Builder disabled captcha for temp form', `version=${currentVersion}`)
+
+    const wrongPassword = await requestRunnerFormAccess(form.id, {
+        password: `${config.tempFormPassword}-wrong`,
+    })
+    if (wrongPassword.response.status !== 403 || wrongPassword.body?.code !== 'FORM_PASSWORD_INVALID') {
+        fail('Runner access wrong password rejected', wrongPassword.response, `body=${JSON.stringify(wrongPassword.body)}`)
+    }
+    logPass('Runner access wrong password rejected')
+
+    const accessGrant = await requestRunnerFormAccess(form.id, {
+        password: config.tempFormPassword,
+    })
+    if (accessGrant.response.status !== 200 || typeof accessGrant.body?.access_token !== 'string') {
+        fail('Runner access success', accessGrant.response, `body=${JSON.stringify(accessGrant.body)}`)
+    }
+    const formAccessToken = accessGrant.body.access_token
+    logPass('Runner access success')
+
+    const unlockedSchema = await fetchRunnerSchema(form.id, {
+        'X-Form-Access-Token': formAccessToken,
+    })
+    if (unlockedSchema.response.status !== 200 || !unlockedSchema.body?.form?.published_schema) {
+        fail('Runner unlocked schema', unlockedSchema.response, `body=${JSON.stringify(unlockedSchema.body)}`)
+    }
+    logPass('Runner unlocked schema')
+
     const validStartedAt = new Date(Date.now() - 60 * 1000).toISOString()
-    const success = await submitRunnerForm(formId, {
+    const success = await submitRunnerForm(form.id, {
         data: {
             email: 'qa.runner@example.com',
             full_name: 'Runner QA',
@@ -456,13 +554,14 @@ async function runRunnerChecks(formId) {
         started_at: validStartedAt,
     }, {
         'Idempotency-Key': randomUUID(),
+        'X-Form-Access-Token': formAccessToken,
         Referer: 'not a url',
         'User-Agent': 'FormSandbox Validation Script/1.0',
     })
     if (success.response.status !== 201 || typeof success.body?.submission_id !== 'string') {
-        fail('Runner success submit', success.response, `body=${JSON.stringify(success.body)}`)
+        fail('Runner protected success submit', success.response, `body=${JSON.stringify(success.body)}`)
     }
-    logPass('Runner success submit', `submission_id=${success.body.submission_id}`)
+    logPass('Runner protected success submit', `submission_id=${success.body.submission_id}`)
 
     if (!config.runProtectedFormChecks) {
         logSkip('Protected-form checks', 'Set FORMSANDBOX_RUN_PROTECTED_FORM_CHECKS=1 to enable')
@@ -477,12 +576,12 @@ async function runRunnerChecks(formId) {
     await expectProtectedRunnerCode(
         'Runner password-protected blocked',
         config.passwordProtectedFormId,
-        'FORM_PASSWORD_REQUIRED'
+        'FORM_ACCESS_TOKEN_INVALID'
     )
     await expectProtectedRunnerCode(
         'Runner captcha blocked',
         config.captchaFormId,
-        'CAPTCHA_REQUIRED_UNSUPPORTED'
+        'CAPTCHA_REQUIRED'
     )
 }
 
@@ -570,8 +669,9 @@ async function main() {
 
     try {
         await runAuthChecks(token)
-        tempFormId = await runBuildChecks(token)
-        await runRunnerChecks(tempFormId)
+        const tempForm = await runBuildChecks(token)
+        tempFormId = tempForm.id
+        await runRunnerChecks(token, tempForm)
 
         if (config.runStripeChecks) {
             await runStripeChecks(token)

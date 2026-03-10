@@ -9,20 +9,21 @@ This guide covers testing core API routes:
 1. `GET /`
 2. `POST /api/v1/auth/signup`
 3. `POST /api/v1/auth/login`
-4. `GET /api/v1/auth/me`
-5. `POST /api/v1/auth/logout`
-6. `GET /api/v1/build/:workspaceId/forms`
-7. `POST /api/v1/build/:workspaceId/forms`
-8. `GET /api/v1/build/:workspaceId/forms/:formId`
-9. `PATCH /api/v1/build/:workspaceId/forms/:formId`
-10. `PATCH /api/v1/build/:workspaceId/forms/:formId/access`
-11. `PUT /api/v1/build/:workspaceId/forms/:formId`
-12. `POST /api/v1/build/:workspaceId/forms/:formId/publish`
-13. `DELETE /api/v1/build/:workspaceId/forms/:formId`
-14. `GET /api/v1/f/:formId/schema`
-15. `POST /api/v1/f/:formId/access`
-16. `POST /api/v1/f/:formId/submit`
-17. `POST /api/v1/stripe/workspaces/:workspaceId/checkout-session`
+4. `GET /api/v1/auth/bootstrap`
+5. `GET /api/v1/auth/me`
+6. `POST /api/v1/auth/logout`
+7. `GET /api/v1/build/:workspaceId/forms`
+8. `POST /api/v1/build/:workspaceId/forms`
+9. `GET /api/v1/build/:workspaceId/forms/:formId`
+10. `PATCH /api/v1/build/:workspaceId/forms/:formId`
+11. `PATCH /api/v1/build/:workspaceId/forms/:formId/access`
+12. `PUT /api/v1/build/:workspaceId/forms/:formId`
+13. `POST /api/v1/build/:workspaceId/forms/:formId/publish`
+14. `DELETE /api/v1/build/:workspaceId/forms/:formId`
+15. `GET /api/v1/f/:formId/schema`
+16. `POST /api/v1/f/:formId/access`
+17. `POST /api/v1/f/:formId/submit`
+18. `POST /api/v1/stripe/workspaces/:workspaceId/checkout-session`
 
 Stripe billing has a dedicated deep-dive matrix in `test-stripe-v1.md`.
 
@@ -96,7 +97,33 @@ Optional Stripe checks:
    - `FORMSANDBOX_INTERNAL_ADMIN_TOKEN`
 
 ## 4. Getting `workspace_id` and Optional Viewer Setup
-Find workspace ID for your user:
+Use bootstrap to capture `workspace_id` for build and Stripe tests.
+
+### 4.1 Workspace Bootstrap (captures `workspace_id`)
+Request:
+1. Method: `GET`
+2. URL: `{{base_url}}/api/v1/auth/bootstrap`
+3. Headers: `Authorization: Bearer {{access_token}}`
+
+Expected:
+1. `200`
+2. JSON has `user.id`
+3. JSON has `current_workspace_id`
+4. JSON has `workspaces[0].role`
+
+Tests tab:
+```javascript
+pm.test("Bootstrap success", function () {
+  pm.expect(pm.response.code).to.eql(200);
+});
+
+const json = pm.response.json();
+pm.environment.set("user_id", json.user.id);
+pm.environment.set("workspace_id", json.current_workspace_id);
+pm.environment.set("workspace_count", json.workspaces.length);
+```
+
+Fallback SQL if bootstrap invariants are being investigated manually:
 ```sql
 SELECT w.id AS workspace_id
 FROM public.workspaces w
@@ -106,7 +133,7 @@ WHERE p.email = 'qa.user@example.com'
 LIMIT 1;
 ```
 
-Optional viewer setup:
+### 4.2 Optional Viewer Setup
 1. Create/login a second user.
 2. Add membership row:
 ```sql
@@ -133,6 +160,7 @@ pm.test("Status is not 401", function () {
 | GET | `/` | No | `200` text |
 | POST | `/api/v1/auth/signup` | No | `201` or `400` |
 | POST | `/api/v1/auth/login` | No | `200` or `401` |
+| GET | `/api/v1/auth/bootstrap` | Yes | `200` / `401` / `409` / `500` |
 | GET | `/api/v1/auth/me` | Yes | `200` |
 | POST | `/api/v1/auth/logout` | Yes | `200` |
 | GET | `/api/v1/build/:workspaceId/forms` | Yes | `200` / `404` |
@@ -210,6 +238,19 @@ Request:
 Expected:
 1. `200`
 2. JSON has `user.id`
+
+### 7.4A Workspace Bootstrap (`/bootstrap`)
+Request:
+1. Method: `GET`
+2. URL: `{{base_url}}/api/v1/auth/bootstrap`
+3. Headers: `Authorization: Bearer {{access_token}}`
+
+Expected:
+1. `200`
+2. JSON has `user.id`
+3. JSON has `current_workspace_id`
+4. JSON has `workspaces[0].id`
+5. Response header `Cache-Control` is `no-store`
 
 ### 7.5 Logout
 Request:
@@ -423,7 +464,8 @@ Expected:
 21. Captcha-enabled unlock/submit without token -> `403 CAPTCHA_REQUIRED`
 22. Captcha-enabled unlock/submit with invalid token -> `403 CAPTCHA_VERIFICATION_FAILED`
 23. Signup/login with uppercase email succeeds and stored request email is normalized lowercase
-24. Malformed `Authorization` header on `/auth/me` or `/auth/logout` -> `401`
+24. Malformed `Authorization` header on `/auth/bootstrap`, `/auth/me`, or `/auth/logout` -> `401`
+25. Authenticated user with zero visible workspaces on `/auth/bootstrap` -> `409 WORKSPACE_BOOTSTRAP_EMPTY`
 
 ### 8.1 Security SQL Audit Snippets
 Search-path hardening audit (expect zero rows):

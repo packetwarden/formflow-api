@@ -5,6 +5,7 @@ import { getSupabaseClient } from '../../db/supabase'
 import { signUpSchema, loginSchema } from '../../utils/validation'
 import { requireAuth } from '../../middlewares/auth'
 import { authPublicWriteRateLimit, authUserWriteRateLimit } from '../../middlewares/rate-limit'
+import { loadWorkspaceBootstrap } from '../../utils/workspace-access'
 
 const authRouter = new Hono<{ Bindings: Env; Variables: Variables }>()
 
@@ -89,6 +90,19 @@ authRouter.post('/logout', requireAuth, authUserWriteRateLimit, async (c) => {
 authRouter.get('/me', requireAuth, async (c) => {
     const user = c.get('user')
     return c.json({ user }, 200)
+})
+
+/**
+ * GET /api/v1/auth/bootstrap
+ * Returns curated authenticated user and workspace bootstrap state.
+ * Requires Authentication.
+ */
+authRouter.get('/bootstrap', requireAuth, async (c) => {
+    const bootstrap = await loadWorkspaceBootstrap(c)
+    if (!bootstrap.ok) return bootstrap.response
+
+    c.header('Cache-Control', 'no-store')
+    return c.json(bootstrap.data, 200)
 })
 
 export default authRouter

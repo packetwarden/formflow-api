@@ -91,6 +91,43 @@ Context contract (`src/types/index.ts`):
 1. `Variables.user: User | null`
 2. `Variables.accessToken: string`
 
+### 6.1 GET `/api/v1/auth/bootstrap`
+Purpose: return frontend bootstrap state after authentication without exposing raw auth/session payloads.
+
+Behavior:
+1. protected by `requireAuth`
+2. uses request-scoped authenticated Supabase client with anon key + caller bearer token
+3. loads curated profile fields from `profiles`:
+   - `id`
+   - `email`
+   - `full_name`
+   - `avatar_url`
+4. loads visible non-deleted workspaces under RLS from `workspaces`:
+   - `id`
+   - `name`
+   - `slug`
+   - `description`
+   - `logo_url`
+   - `plan`
+   - `created_at`
+   - `updated_at`
+5. resolves workspace `role` from ownership or matching `workspace_members` row
+6. resolves `is_personal = (workspace.owner_id = auth user id)`
+7. sorts workspaces deterministically by:
+   - `is_personal DESC`
+   - `created_at ASC`
+   - `id ASC`
+8. returns `current_workspace_id` as the first sorted workspace
+9. sets `Cache-Control: no-store`
+
+Error contract:
+1. `401` via `requireAuth` for missing/invalid bearer token
+2. `409` `{ error, code: "WORKSPACE_BOOTSTRAP_EMPTY" }` when user has zero visible workspaces
+3. `500` `{ error, code: "BOOTSTRAP_LOAD_FAILED" }` on profile/workspace/membership load failure or invariant mismatch
+
+Compatibility:
+1. `GET /api/v1/auth/me` remains unchanged and still returns only `{ user }`
+
 ## 7. Supabase Client Pattern
 `getSupabaseClient` in `src/db/supabase.ts` now supports request-scoped auth:
 1. signature: `getSupabaseClient(url, key, accessToken?, extraHeaders?)`

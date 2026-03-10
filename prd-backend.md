@@ -40,6 +40,7 @@ We utilize a RESTful design optimized through Hono's `app.route()` grouping feat
 | **POST** | `/api/v1/auth/signup` | Register a new user via Supabase Auth. | No |
 | **POST** | `/api/v1/auth/login` | Authenticate user and return session. | No |
 | **POST** | `/api/v1/auth/logout` | Invalidate current session. | Yes (Bearer) |
+| **GET** | `/api/v1/auth/bootstrap` | Fetch frontend bootstrap state: curated user, visible workspaces, and current workspace id. | Yes (Bearer) |
 | **GET** | `/api/v1/auth/me` | Fetch the current authenticated user's profile. | Yes (Bearer) |
 | **Builder Group (`/api/v1/build/:workspaceId/*`)** |  |  |  |
 | **GET** | `/api/v1/build/:workspaceId/forms` | Fetch all forms belonging to the workspace. | Yes (Bearer) |

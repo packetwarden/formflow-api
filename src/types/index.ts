@@ -36,6 +36,34 @@ export interface Variables {
     accessToken: string;
 }
 
+export type WorkspacePlanSlug = 'free' | 'pro' | 'business' | 'enterprise'
+
+export interface AuthBootstrapUser {
+    id: string
+    email: string
+    full_name: string | null
+    avatar_url: string | null
+}
+
+export interface AuthBootstrapWorkspace {
+    id: string
+    name: string
+    slug: string
+    description: string | null
+    logo_url: string | null
+    plan: WorkspacePlanSlug
+    role: 'owner' | 'admin' | 'editor' | 'viewer'
+    is_personal: boolean
+    created_at: string
+    updated_at: string
+}
+
+export interface AuthBootstrapResponse {
+    user: AuthBootstrapUser
+    current_workspace_id: string
+    workspaces: AuthBootstrapWorkspace[]
+}
+
 export type RunnerErrorCode =
     | 'UNSUPPORTED_FORM_SCHEMA'
     | 'FIELD_VALIDATION_FAILED'
