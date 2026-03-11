@@ -1,9 +1,22 @@
 import type { Context } from 'hono'
 import { getSupabaseClient } from '../db/supabase'
-import type { AuthBootstrapResponse, AuthBootstrapUser, AuthBootstrapWorkspace, Env, Variables } from '../types'
+import type {
+    AuthBootstrapResponse,
+    AuthBootstrapUser,
+    AuthBootstrapWorkspace,
+    Env,
+    Variables,
+    WorkspaceMembershipSummary,
+    WorkspaceOverviewResponse,
+    WorkspaceOwnerSummary,
+    WorkspaceRoleSummary,
+    WorkspaceSettingsResponse,
+    WorkspaceSettingsV1,
+} from '../types'
+import { workspaceSettingsSchema } from './validation'
 
 export type WorkspaceRole = 'owner' | 'admin' | 'editor' | 'viewer'
-export type RequiredWorkspaceRole = 'member' | 'editor' | 'admin'
+export type RequiredWorkspaceRole = 'member' | 'editor' | 'admin' | 'owner'
 
 export type AppContext = Context<{ Bindings: Env; Variables: Variables }>
 
@@ -30,6 +43,26 @@ type BootstrapMembershipRow = {
     role: string
 }
 
+type WorkspaceRecordRow = {
+    id: string
+    owner_id: string
+    slug: string
+    name: string
+    description: string | null
+    logo_url: string | null
+    settings: unknown
+    plan: AuthBootstrapWorkspace['plan']
+    version: number
+    created_at: string
+    updated_at: string
+}
+
+type WorkspaceMemberCountRow = {
+    workspace_id: string
+}
+
+type OwnerProfileRow = WorkspaceOwnerSummary
+
 const normalizeWorkspaceRole = (role: string): WorkspaceRole | null => {
     if (role === 'owner' || role === 'admin' || role === 'editor' || role === 'viewer') {
         return role
@@ -48,6 +81,177 @@ const sortBootstrapWorkspaces = (left: AuthBootstrapWorkspace, right: AuthBootst
     }
 
     return left.id.localeCompare(right.id)
+}
+
+const mergeDefinedValues = <T extends object>(current: T | undefined, patch: T | undefined): T | undefined => {
+    if (!current && !patch) return undefined
+    return {
+        ...(current ?? {}),
+        ...(patch ?? {}),
+    } as T
+}
+
+export const parseWorkspaceSettings = (settings: unknown) => {
+    const parseResult = workspaceSettingsSchema.safeParse(settings ?? {})
+    if (!parseResult.success) {
+        return {
+            ok: false as const,
+            error: parseResult.error,
+        }
+    }
+
+    return {
+        ok: true as const,
+        settings: parseResult.data as WorkspaceSettingsV1,
+    }
+}
+
+export const mergeWorkspaceSettings = (
+    current: WorkspaceSettingsV1,
+    patch: WorkspaceSettingsV1 | undefined
+): WorkspaceSettingsV1 => {
+    if (!patch) return current
+
+    return {
+        about: mergeDefinedValues(current.about, patch.about),
+        branding: mergeDefinedValues(current.branding, patch.branding),
+        preferences: mergeDefinedValues(current.preferences, patch.preferences),
+    }
+}
+
+const toWorkspaceMembershipSummary = (
+    role: WorkspaceRoleSummary
+): WorkspaceMembershipSummary => ({
+    role,
+    is_owner: role === 'owner',
+    can_edit_settings: role === 'owner',
+})
+
+const loadWorkspaceRecord = async (c: AppContext, workspaceId: string) => {
+    const supabase = getAuthScopedSupabaseClient(c)
+
+    const { data, error } = await supabase
+        .from('workspaces')
+        .select('id, owner_id, slug, name, description, logo_url, settings, plan, version, created_at, updated_at')
+        .eq('id', workspaceId)
+        .is('deleted_at', null)
+        .maybeSingle<WorkspaceRecordRow>()
+
+    if (error) {
+        console.error('Workspace load error:', error)
+        return { ok: false as const, response: c.json({ error: 'Failed to load workspace' }, 500) }
+    }
+
+    if (!data) {
+        return { ok: false as const, response: c.json({ error: 'Workspace not found' }, 404) }
+    }
+
+    return { ok: true as const, workspace: data }
+}
+
+export const loadWorkspaceOverview = async (c: AppContext, workspaceId: string) => {
+    const roleResult = await resolveWorkspaceRole(c, workspaceId)
+    if (!roleResult.ok) return roleResult
+
+    const workspaceResult = await loadWorkspaceRecord(c, workspaceId)
+    if (!workspaceResult.ok) return workspaceResult
+
+    const settingsResult = parseWorkspaceSettings(workspaceResult.workspace.settings)
+    if (!settingsResult.ok) {
+        console.error('Workspace overview settings parse error:', {
+            workspace_id: workspaceId,
+            issues: settingsResult.error.issues,
+        })
+        return { ok: false as const, response: c.json({ error: 'Failed to load workspace overview' }, 500) }
+    }
+
+    const supabase = getAuthScopedSupabaseClient(c)
+    const [
+        { data: owner, error: ownerError },
+        memberCountResult,
+    ] = await Promise.all([
+        supabase
+            .from('profiles')
+            .select('id, full_name, avatar_url')
+            .eq('id', workspaceResult.workspace.owner_id)
+            .is('deleted_at', null)
+            .maybeSingle<OwnerProfileRow>(),
+        supabase
+            .from('workspace_members')
+            .select('workspace_id', { count: 'exact', head: true })
+            .eq('workspace_id', workspaceId)
+            .returns<WorkspaceMemberCountRow[]>(),
+    ])
+
+    if (ownerError || memberCountResult.error) {
+        console.error('Workspace overview related load error:', {
+            workspace_id: workspaceId,
+            owner_error: ownerError?.message ?? null,
+            member_count_error: memberCountResult.error?.message ?? null,
+        })
+        return { ok: false as const, response: c.json({ error: 'Failed to load workspace overview' }, 500) }
+    }
+
+    if (!owner) {
+        console.error('Workspace overview missing owner profile', {
+            workspace_id: workspaceId,
+            owner_id: workspaceResult.workspace.owner_id,
+        })
+        return { ok: false as const, response: c.json({ error: 'Failed to load workspace overview' }, 500) }
+    }
+
+    const response: WorkspaceOverviewResponse = {
+        workspace: {
+            id: workspaceResult.workspace.id,
+            slug: workspaceResult.workspace.slug,
+            name: workspaceResult.workspace.name,
+            description: workspaceResult.workspace.description,
+            logo_url: workspaceResult.workspace.logo_url,
+            plan: workspaceResult.workspace.plan,
+            created_at: workspaceResult.workspace.created_at,
+            updated_at: workspaceResult.workspace.updated_at,
+        },
+        owner,
+        membership: toWorkspaceMembershipSummary(roleResult.role),
+        summary: {
+            member_count: memberCountResult.count ?? 0,
+            settings: settingsResult.settings,
+        },
+    }
+
+    return { ok: true as const, overview: response }
+}
+
+export const loadWorkspaceSettingsDocument = async (c: AppContext, workspaceId: string) => {
+    const ownerCheck = await enforceWorkspaceRole(c, workspaceId, 'owner')
+    if (!ownerCheck.ok) return ownerCheck
+
+    const workspaceResult = await loadWorkspaceRecord(c, workspaceId)
+    if (!workspaceResult.ok) return workspaceResult
+
+    const settingsResult = parseWorkspaceSettings(workspaceResult.workspace.settings)
+    if (!settingsResult.ok) {
+        console.error('Workspace settings parse error:', {
+            workspace_id: workspaceId,
+            issues: settingsResult.error.issues,
+        })
+        return { ok: false as const, response: c.json({ error: 'Failed to load workspace settings' }, 500) }
+    }
+
+    const response: WorkspaceSettingsResponse = {
+        workspace: {
+            id: workspaceResult.workspace.id,
+            slug: workspaceResult.workspace.slug,
+            name: workspaceResult.workspace.name,
+            description: workspaceResult.workspace.description,
+            logo_url: workspaceResult.workspace.logo_url,
+            version: workspaceResult.workspace.version,
+            updated_at: workspaceResult.workspace.updated_at,
+        },
+        settings: settingsResult.settings,
+    }
+
+    return { ok: true as const, settings: response }
 }
 
 export const loadWorkspaceBootstrap = async (c: AppContext) => {
@@ -265,6 +469,7 @@ export const resolveWorkspaceRole = async (c: AppContext, workspaceId: string) =
 
 export const hasRequiredWorkspaceRole = (role: WorkspaceRole, required: RequiredWorkspaceRole) => {
     if (required === 'member') return true
+    if (required === 'owner') return role === 'owner'
     if (required === 'editor') return role === 'owner' || role === 'admin' || role === 'editor'
     return role === 'owner' || role === 'admin'
 }

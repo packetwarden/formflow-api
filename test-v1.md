@@ -12,18 +12,21 @@ This guide covers testing core API routes:
 4. `GET /api/v1/auth/bootstrap`
 5. `GET /api/v1/auth/me`
 6. `POST /api/v1/auth/logout`
-7. `GET /api/v1/build/:workspaceId/forms`
-8. `POST /api/v1/build/:workspaceId/forms`
-9. `GET /api/v1/build/:workspaceId/forms/:formId`
-10. `PATCH /api/v1/build/:workspaceId/forms/:formId`
-11. `PATCH /api/v1/build/:workspaceId/forms/:formId/access`
-12. `PUT /api/v1/build/:workspaceId/forms/:formId`
-13. `POST /api/v1/build/:workspaceId/forms/:formId/publish`
-14. `DELETE /api/v1/build/:workspaceId/forms/:formId`
-15. `GET /api/v1/f/:formId/schema`
-16. `POST /api/v1/f/:formId/access`
-17. `POST /api/v1/f/:formId/submit`
-18. `POST /api/v1/stripe/workspaces/:workspaceId/checkout-session`
+7. `GET /api/v1/workspaces/:workspaceId/overview`
+8. `GET /api/v1/workspaces/:workspaceId/settings`
+9. `PATCH /api/v1/workspaces/:workspaceId/settings`
+10. `GET /api/v1/build/:workspaceId/forms`
+11. `POST /api/v1/build/:workspaceId/forms`
+12. `GET /api/v1/build/:workspaceId/forms/:formId`
+13. `PATCH /api/v1/build/:workspaceId/forms/:formId`
+14. `PATCH /api/v1/build/:workspaceId/forms/:formId/access`
+15. `PUT /api/v1/build/:workspaceId/forms/:formId`
+16. `POST /api/v1/build/:workspaceId/forms/:formId/publish`
+17. `DELETE /api/v1/build/:workspaceId/forms/:formId`
+18. `GET /api/v1/f/:formId/schema`
+19. `POST /api/v1/f/:formId/access`
+20. `POST /api/v1/f/:formId/submit`
+21. `POST /api/v1/stripe/workspaces/:workspaceId/checkout-session`
 
 Stripe billing has a dedicated deep-dive matrix in `test-stripe-v1.md`.
 
@@ -56,6 +59,7 @@ Create a Postman environment with these variables:
 | `password` | `StrongPassw0rd!` | Yes |
 | `access_token` | (set dynamically from login) | Yes |
 | `workspace_id` | UUID | Yes (for build tests) |
+| `workspace_version` | integer | Optional (workspace settings tests) |
 | `form_id` | UUID | Yes (captured from create) |
 | `form_version` | integer | Yes (for update tests) |
 | `user_id` | UUID | Optional |
@@ -76,19 +80,32 @@ Required environment variables:
 Default script behavior:
 1. logs in if needed
 2. checks `/`
-3. checks `/api/v1/auth/me`
-4. creates a temporary builder form automatically
-5. verifies build validation failures (`422`, invalid redirect `400`)
-6. publishes the temporary form
-7. verifies runner validation failures and a successful submit
-8. deletes the temporary form unless `FORMSANDBOX_KEEP_ARTIFACTS=1`
+3. checks `/api/v1/auth/bootstrap`
+4. optionally checks workspace overview/settings routes
+5. checks `/api/v1/auth/me`
+6. creates a temporary builder form automatically
+7. verifies build validation failures (`422`, invalid redirect `400`)
+8. publishes the temporary form
+9. verifies runner validation failures and a successful submit
+10. deletes the temporary form unless `FORMSANDBOX_KEEP_ARTIFACTS=1`
 
 Optional protected-form checks:
-1. set `FORMSANDBOX_RUN_PROTECTED_FORM_CHECKS=1`
+1. password-protected routes:
+   - set `FORMSANDBOX_RUN_PASSWORD_PROTECTED_FORM_CHECKS=1`
+   - set `FORMSANDBOX_PASSWORD_PROTECTED_FORM_ID`
+2. require-auth capability probe:
+   - set `FORMSANDBOX_RUN_REQUIRE_AUTH_FORM_CHECKS=1`
+   - set `FORMSANDBOX_REQUIRE_AUTH_FORM_ID`
+3. captcha-protected routes:
+   - set `FORMSANDBOX_RUN_CAPTCHA_FORM_CHECKS=1`
+   - set `FORMSANDBOX_CAPTCHA_FORM_ID`
+
+Optional workspace checks:
+1. set `FORMSANDBOX_RUN_WORKSPACE_CHECKS=1`
 2. also set:
-   - `FORMSANDBOX_REQUIRE_AUTH_FORM_ID`
-   - `FORMSANDBOX_PASSWORD_PROTECTED_FORM_ID`
-   - `FORMSANDBOX_CAPTCHA_FORM_ID`
+   - `FORMSANDBOX_WORKSPACE_ID`
+3. optional for negative permission checks:
+   - `FORMSANDBOX_VIEWER_ACCESS_TOKEN`
 
 Optional Stripe checks:
 1. set `FORMSANDBOX_RUN_STRIPE_CHECKS=1`
@@ -163,6 +180,9 @@ pm.test("Status is not 401", function () {
 | GET | `/api/v1/auth/bootstrap` | Yes | `200` / `401` / `409` / `500` |
 | GET | `/api/v1/auth/me` | Yes | `200` |
 | POST | `/api/v1/auth/logout` | Yes | `200` |
+| GET | `/api/v1/workspaces/:workspaceId/overview` | Yes | `200` / `401` / `404` / `500` |
+| GET | `/api/v1/workspaces/:workspaceId/settings` | Yes (owner only) | `200` / `401` / `403` / `404` / `500` |
+| PATCH | `/api/v1/workspaces/:workspaceId/settings` | Yes (owner only) | `200` / `400` / `401` / `403` / `404` / `409` / `500` |
 | GET | `/api/v1/build/:workspaceId/forms` | Yes | `200` / `404` |
 | POST | `/api/v1/build/:workspaceId/forms` | Yes | `201` / `403` / `404` / `422` |
 | GET | `/api/v1/build/:workspaceId/forms/:formId` | Yes | `200` / `404` |
@@ -251,6 +271,100 @@ Expected:
 3. JSON has `current_workspace_id`
 4. JSON has `workspaces[0].id`
 5. Response header `Cache-Control` is `no-store`
+
+### 7.4B Workspace Overview (`/workspaces/:workspaceId/overview`)
+Request:
+1. Method: `GET`
+2. URL: `{{base_url}}/api/v1/workspaces/{{workspace_id}}/overview`
+3. Headers: `Authorization: Bearer {{access_token}}`
+
+Expected:
+1. `200`
+2. JSON has `workspace.id = {{workspace_id}}`
+3. JSON has `membership.role`
+4. JSON has `summary.member_count`
+5. JSON has `summary.settings`
+6. JSON does not expose raw editable `version`
+
+Tests tab:
+```javascript
+pm.test("Workspace overview success", function () {
+  pm.expect(pm.response.code).to.eql(200);
+});
+
+const json = pm.response.json();
+pm.expect(json.workspace.id).to.eql(pm.environment.get("workspace_id"));
+pm.expect(json.membership.role).to.be.a("string");
+pm.expect(json.summary.member_count).to.be.a("number");
+```
+
+### 7.4C Workspace Settings Read (`/workspaces/:workspaceId/settings`)
+Request:
+1. Method: `GET`
+2. URL: `{{base_url}}/api/v1/workspaces/{{workspace_id}}/settings`
+3. Headers: `Authorization: Bearer {{access_token}}`
+
+Expected:
+1. `200` for owner
+2. JSON has `workspace.version`
+3. JSON has typed `settings`
+
+Tests tab:
+```javascript
+pm.test("Workspace settings fetch success", function () {
+  pm.expect(pm.response.code).to.eql(200);
+});
+
+const json = pm.response.json();
+pm.environment.set("workspace_version", json.workspace.version);
+```
+
+### 7.4D Workspace Settings Patch (`/workspaces/:workspaceId/settings`)
+Request:
+1. Method: `PATCH`
+2. URL: `{{base_url}}/api/v1/workspaces/{{workspace_id}}/settings`
+3. Headers:
+   - `Authorization: Bearer {{access_token}}`
+   - `Content-Type: application/json`
+4. Body:
+```json
+{
+  "version": {{workspace_version}},
+  "settings": {
+    "about": {
+      "tagline": "Workspace settings updated from Postman"
+    }
+  }
+}
+```
+
+Expected:
+1. `200`
+2. `workspace.version` increments
+3. `settings.about.tagline` reflects the change
+
+Tests tab:
+```javascript
+pm.test("Workspace settings patch success", function () {
+  pm.expect(pm.response.code).to.eql(200);
+});
+
+const json = pm.response.json();
+pm.environment.set("workspace_version", json.workspace.version);
+```
+
+### 7.4E Workspace Settings Patch Conflict
+Use the same request as 7.4D with an older `workspace_version`.
+
+Expected:
+1. `409`
+2. Response shape:
+```json
+{
+  "error": "Version conflict",
+  "current_version": 3
+}
+```
 
 ### 7.5 Logout
 Request:
@@ -466,6 +580,13 @@ Expected:
 23. Signup/login with uppercase email succeeds and stored request email is normalized lowercase
 24. Malformed `Authorization` header on `/auth/bootstrap`, `/auth/me`, or `/auth/logout` -> `401`
 25. Authenticated user with zero visible workspaces on `/auth/bootstrap` -> `409 WORKSPACE_BOOTSTRAP_EMPTY`
+26. Non-member `GET /workspaces/:workspaceId/overview` -> `404`
+27. Viewer `GET /workspaces/:workspaceId/settings` -> `403`
+28. Viewer `PATCH /workspaces/:workspaceId/settings` -> `403`
+29. Workspace settings patch with stale `version` -> `409`
+30. Workspace settings patch with unknown nested key -> `400`
+31. Workspace settings patch with invalid URL/color/email/timezone -> `400`
+32. Workspace overview response must not expose raw `settings`, `version`, `retention_days`, or billing internals
 
 ### 8.1 Security SQL Audit Snippets
 Search-path hardening audit (expect zero rows):

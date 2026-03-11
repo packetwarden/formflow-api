@@ -64,6 +64,89 @@ export interface AuthBootstrapResponse {
     workspaces: AuthBootstrapWorkspace[]
 }
 
+export type WorkspaceRoleSummary = 'owner' | 'admin' | 'editor' | 'viewer'
+
+export interface WorkspaceSettingsAboutV1 {
+    tagline?: string | null
+    website_url?: string | null
+    support_email?: string | null
+    support_url?: string | null
+}
+
+export interface WorkspaceSettingsBrandingV1 {
+    primary_color?: string | null
+    accent_color?: string | null
+}
+
+export interface WorkspaceSettingsPreferencesV1 {
+    default_locale?: string | null
+    default_timezone?: string | null
+}
+
+export interface WorkspaceSettingsV1 {
+    about?: WorkspaceSettingsAboutV1
+    branding?: WorkspaceSettingsBrandingV1
+    preferences?: WorkspaceSettingsPreferencesV1
+}
+
+export interface WorkspaceOverviewWorkspace {
+    id: string
+    slug: string
+    name: string
+    description: string | null
+    logo_url: string | null
+    plan: WorkspacePlanSlug
+    created_at: string
+    updated_at: string
+}
+
+export interface WorkspaceOwnerSummary {
+    id: string
+    full_name: string | null
+    avatar_url: string | null
+}
+
+export interface WorkspaceMembershipSummary {
+    role: WorkspaceRoleSummary
+    is_owner: boolean
+    can_edit_settings: boolean
+}
+
+export interface WorkspaceOverviewSettingsSummary extends WorkspaceSettingsV1 {}
+
+export interface WorkspaceOverviewResponse {
+    workspace: WorkspaceOverviewWorkspace
+    owner: WorkspaceOwnerSummary
+    membership: WorkspaceMembershipSummary
+    summary: {
+        member_count: number
+        settings: WorkspaceOverviewSettingsSummary
+    }
+}
+
+export interface WorkspaceSettingsEditableWorkspace {
+    id: string
+    slug: string
+    name: string
+    description: string | null
+    logo_url: string | null
+    version: number
+    updated_at: string
+}
+
+export interface WorkspaceSettingsResponse {
+    workspace: WorkspaceSettingsEditableWorkspace
+    settings: WorkspaceSettingsV1
+}
+
+export interface UpdateWorkspaceSettingsInput {
+    version: number
+    name?: string
+    description?: string | null
+    logo_url?: string | null
+    settings?: WorkspaceSettingsV1
+}
+
 export type RunnerErrorCode =
     | 'UNSUPPORTED_FORM_SCHEMA'
     | 'FIELD_VALIDATION_FAILED'

@@ -128,6 +128,90 @@ Error contract:
 Compatibility:
 1. `GET /api/v1/auth/me` remains unchanged and still returns only `{ user }`
 
+### 6.2 Workspace Overview and Settings API
+Purpose: expose workspace-safe member-visible metadata plus a separate owner-only settings document for admin editing.
+
+Routes:
+1. `GET /api/v1/workspaces/:workspaceId/overview`
+2. `GET /api/v1/workspaces/:workspaceId/settings`
+3. `PATCH /api/v1/workspaces/:workspaceId/settings`
+
+Authorization model:
+1. all routes are protected by `requireAuth`
+2. overview is readable by any visible workspace member (`owner`, `admin`, `editor`, `viewer`)
+3. settings read/write routes are owner-only
+4. authorization is enforced twice:
+   - Worker route guard in `src/utils/workspace-access.ts`
+   - Postgres RLS owner-only `UPDATE` policy on `public.workspaces`
+
+Overview contract (`GET /api/v1/workspaces/:workspaceId/overview`):
+1. uses request-scoped authenticated Supabase client with caller bearer token
+2. loads visible non-deleted workspace row under RLS
+3. returns curated response:
+   - `workspace`: `id`, `slug`, `name`, `description`, `logo_url`, `plan`, `created_at`, `updated_at`
+   - `owner`: `id`, `full_name`, `avatar_url`
+   - `membership`: `role`, `is_owner`, `can_edit_settings`
+   - `summary.member_count`
+   - `summary.settings` from typed safe namespaces only
+4. member-visible overview intentionally excludes:
+   - raw `workspaces.settings`
+   - `retention_days`
+   - Stripe/billing internals
+   - owner email
+
+Settings document contract (`GET /api/v1/workspaces/:workspaceId/settings`):
+1. owner-only
+2. returns editable workspace metadata:
+   - `id`, `slug`, `name`, `description`, `logo_url`, `version`, `updated_at`
+3. returns strictly typed `settings` document
+
+PATCH contract (`PATCH /api/v1/workspaces/:workspaceId/settings`):
+1. owner-only
+2. requires `version` for optimistic locking
+3. supports partial updates for:
+   - top-level fields: `name`, `description`, `logo_url`
+   - settings namespaces: `about`, `branding`, `preferences`
+4. merges namespace patches over the current stored settings document
+5. rejects unknown top-level and nested keys via strict Zod validation
+6. updates succeed only when:
+   - `id = :workspaceId`
+   - `version = clientVersion`
+   - `deleted_at IS NULL`
+7. on stale write returns:
+   - `409 { error: "Version conflict", current_version }`
+
+Typed workspace settings namespaces:
+1. `about`
+   - `tagline`
+   - `website_url`
+   - `support_email`
+   - `support_url`
+2. `branding`
+   - `primary_color`
+   - `accent_color`
+3. `preferences`
+   - `default_locale`
+   - `default_timezone`
+
+Validation and normalization:
+1. URLs must be absolute `http(s)`
+2. colors must be 6-digit hex values
+3. email is normalized lowercase
+4. locale is canonicalized via `Intl.getCanonicalLocales`
+5. timezone must be a valid IANA timezone identifier
+6. blank clearable values normalize to `null`
+
+Database requirements:
+1. `public.workspaces.version INTEGER NOT NULL DEFAULT 1 CHECK (version >= 1)`
+2. authenticated column-level `UPDATE` grants limited to:
+   - `name`
+   - `description`
+   - `logo_url`
+   - `settings`
+   - `version`
+3. no broad table-level update grant added
+4. no service-role write path required for workspace settings
+
 ## 7. Supabase Client Pattern
 `getSupabaseClient` in `src/db/supabase.ts` now supports request-scoped auth:
 1. signature: `getSupabaseClient(url, key, accessToken?, extraHeaders?)`
@@ -869,7 +953,9 @@ Least-privilege grants hardening v1 in V2:
 3. direct authenticated writes are now limited to `public.forms` with column-level grants:
    - `INSERT`: `workspace_id`, `title`, `slug`, `description`, `schema`, `max_submissions`, `accept_submissions`, `success_message`, `redirect_url`
    - `UPDATE`: `title`, `description`, `schema`, `max_submissions`, `accept_submissions`, `success_message`, `redirect_url`, `version`, `status`, `deleted_at`
-4. direct hard-delete grant paths removed from soft-delete tables for `authenticated`:
+4. direct authenticated writes to `public.workspaces` remain least-privilege column grants only:
+   - `UPDATE`: `name`, `description`, `logo_url`, `settings`, `version`
+5. direct hard-delete grant paths removed from soft-delete tables for `authenticated`:
    - `profiles`, `workspaces`, `forms`, `form_submissions`
 
 Function search-path hardening v3 in V2:
@@ -896,6 +982,7 @@ Migration sources now folded into canonical V2 baseline:
 14. `project-info-docs/migrations/2026-03-06_function_search_path_hardening_v3.sql`
 15. `project-info-docs/migrations/2026-03-07_runner_service_role_secret_key_compat_v1.sql`
 16. `project-info-docs/migrations/2026-03-07_build_submission_read_grants_v1.sql`
+17. `project-info-docs/migrations/2026-03-11_workspace_overview_settings_v1.sql`
 
 ## 11. Implementation Files Added or Updated
 Updated:
@@ -908,9 +995,11 @@ Updated:
 7. `src/routes/stripe/index.ts`
 8. `src/index.ts`
 9. `src/utils/workspace-access.ts`
-10. `changelog.md`
-11. `dev-docs.md`
-12. `project-info-docs/formflow_beta_schema_v2.sql`
+10. `src/routes/workspaces/index.ts`
+11. `changelog.md`
+12. `dev-docs.md`
+13. `project-info-docs/formflow_beta_schema_v2.sql`
+14. `scripts/server-side-validation-check.mjs`
 
 Added:
 1. `project-info-docs/migrations/2026-02-23_fix_publish_form.sql`
@@ -930,9 +1019,10 @@ Added:
 14. `project-info-docs/migrations/2026-03-06_function_search_path_hardening_v3.sql`
 15. `project-info-docs/migrations/2026-03-07_runner_service_role_secret_key_compat_v1.sql`
 16. `project-info-docs/migrations/2026-03-07_build_submission_read_grants_v1.sql`
-17. `project-info-docs/stripe-implementation.md`
-18. `runner-api-beta.md`
-19. `test-runner-public-v1.md`
+17. `project-info-docs/migrations/2026-03-11_workspace_overview_settings_v1.sql`
+18. `project-info-docs/stripe-implementation.md`
+19. `runner-api-beta.md`
+20. `test-runner-public-v1.md`
 
 ## 12. Operational Runbook
 For fresh database setup:

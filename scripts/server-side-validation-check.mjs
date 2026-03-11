@@ -10,10 +10,22 @@ const config = {
     workspaceId: env.FORMSANDBOX_WORKSPACE_ID ?? env.WORKSPACE_ID ?? '',
     keepArtifacts: env.FORMSANDBOX_KEEP_ARTIFACTS === '1',
     runProtectedFormChecks: env.FORMSANDBOX_RUN_PROTECTED_FORM_CHECKS === '1',
+    runRequireAuthFormChecks:
+        env.FORMSANDBOX_RUN_REQUIRE_AUTH_FORM_CHECKS === '1'
+        || env.FORMSANDBOX_RUN_PROTECTED_FORM_CHECKS === '1',
+    runPasswordProtectedFormChecks:
+        env.FORMSANDBOX_RUN_PASSWORD_PROTECTED_FORM_CHECKS === '1'
+        || env.FORMSANDBOX_RUN_PROTECTED_FORM_CHECKS === '1',
+    runCaptchaFormChecks:
+        env.FORMSANDBOX_RUN_CAPTCHA_FORM_CHECKS === '1'
+        || env.FORMSANDBOX_RUN_PROTECTED_FORM_CHECKS === '1',
     requireAuthFormId: env.FORMSANDBOX_REQUIRE_AUTH_FORM_ID ?? '',
     passwordProtectedFormId: env.FORMSANDBOX_PASSWORD_PROTECTED_FORM_ID ?? '',
     captchaFormId: env.FORMSANDBOX_CAPTCHA_FORM_ID ?? '',
+    requireAuthProbeFormId: env.FORMSANDBOX_REQUIRE_AUTH_PROBE_FORM_ID ?? '',
     tempFormPassword: env.FORMSANDBOX_TEMP_FORM_PASSWORD ?? 'TempFormPassword123!',
+    runWorkspaceChecks: env.FORMSANDBOX_RUN_WORKSPACE_CHECKS === '1',
+    viewerAccessToken: env.FORMSANDBOX_VIEWER_ACCESS_TOKEN ?? '',
     runStripeChecks: env.FORMSANDBOX_RUN_STRIPE_CHECKS === '1',
     stripeWorkspaceId: env.FORMSANDBOX_STRIPE_WORKSPACE_ID ?? '',
     internalAdminToken: env.FORMSANDBOX_INTERNAL_ADMIN_TOKEN ?? '',
@@ -38,16 +50,16 @@ function assertConfig() {
         throw new Error(`Missing required environment variables: ${missing.join(', ')}`)
     }
 
-    if (config.runProtectedFormChecks) {
-        const protectedMissing = []
-        if (!config.requireAuthFormId) protectedMissing.push('FORMSANDBOX_REQUIRE_AUTH_FORM_ID')
-        if (!config.passwordProtectedFormId) protectedMissing.push('FORMSANDBOX_PASSWORD_PROTECTED_FORM_ID')
-        if (!config.captchaFormId) protectedMissing.push('FORMSANDBOX_CAPTCHA_FORM_ID')
-        if (protectedMissing.length > 0) {
-            throw new Error(
-                `Protected-form checks require: ${protectedMissing.join(', ')}`
-            )
-        }
+    if (config.runRequireAuthFormChecks && !config.requireAuthFormId) {
+        throw new Error('Require-auth checks require: FORMSANDBOX_REQUIRE_AUTH_FORM_ID')
+    }
+
+    if (config.runPasswordProtectedFormChecks && !config.passwordProtectedFormId) {
+        throw new Error('Password-protected checks require: FORMSANDBOX_PASSWORD_PROTECTED_FORM_ID')
+    }
+
+    if (config.runCaptchaFormChecks && !config.captchaFormId) {
+        throw new Error('Captcha checks require: FORMSANDBOX_CAPTCHA_FORM_ID')
     }
 
     if (config.runStripeChecks) {
@@ -112,6 +124,62 @@ function authHeaders(token) {
     }
 }
 
+function assertBootstrapPayload(body) {
+    if (!body?.user?.id) {
+        throw new Error('/auth/bootstrap did not return user.id')
+    }
+
+    if (typeof body.current_workspace_id !== 'string' || body.current_workspace_id.length === 0) {
+        throw new Error('/auth/bootstrap did not return current_workspace_id')
+    }
+
+    if (!Array.isArray(body.workspaces) || body.workspaces.length === 0) {
+        throw new Error('/auth/bootstrap did not return any workspaces')
+    }
+
+    const currentWorkspace = body.workspaces.find((workspace) => workspace?.id === body.current_workspace_id)
+    if (!currentWorkspace) {
+        throw new Error('/auth/bootstrap current_workspace_id was not present in workspaces[]')
+    }
+
+    for (const workspace of body.workspaces) {
+        if (typeof workspace?.id !== 'string' || workspace.id.length === 0) {
+            throw new Error('/auth/bootstrap returned workspace without id')
+        }
+        if (typeof workspace?.slug !== 'string' || workspace.slug.length === 0) {
+            throw new Error(`/auth/bootstrap returned workspace ${workspace.id} without slug`)
+        }
+        if (typeof workspace?.role !== 'string' || workspace.role.length === 0) {
+            throw new Error(`/auth/bootstrap returned workspace ${workspace.id} without role`)
+        }
+        if (typeof workspace?.is_personal !== 'boolean') {
+            throw new Error(`/auth/bootstrap returned workspace ${workspace.id} without boolean is_personal`)
+        }
+        if (typeof workspace?.plan !== 'string' || workspace.plan.length === 0) {
+            throw new Error(`/auth/bootstrap returned workspace ${workspace.id} without plan`)
+        }
+    }
+
+    for (let index = 1; index < body.workspaces.length; index += 1) {
+        const previous = body.workspaces[index - 1]
+        const current = body.workspaces[index]
+        const previousSortKey = [
+            previous.is_personal ? '0' : '1',
+            previous.created_at,
+            previous.id,
+        ].join('|')
+        const currentSortKey = [
+            current.is_personal ? '0' : '1',
+            current.created_at,
+            current.id,
+        ].join('|')
+
+        if (previousSortKey > currentSortKey) {
+            throw new Error('/auth/bootstrap workspaces were not returned in deterministic order')
+        }
+    }
+}
+
 async function login() {
     if (config.accessToken) {
         logPass('Use existing access token')
@@ -151,12 +219,66 @@ async function runAuthChecks(token) {
     }
     logPass('Auth me', `user_id=${me.user.id}`)
 
+    const bootstrap = await expectStatus('Auth bootstrap', '/api/v1/auth/bootstrap', 200, {
+        headers: authHeaders(token),
+    })
+    assertBootstrapPayload(bootstrap)
+
+    const configuredWorkspace = bootstrap.workspaces.find((workspace) => workspace.id === config.workspaceId)
+    if (!configuredWorkspace) {
+        throw new Error(
+            `/auth/bootstrap did not include configured workspace ${config.workspaceId} in workspaces[]`
+        )
+    }
+    logPass(
+        'Auth bootstrap',
+        `current_workspace_id=${bootstrap.current_workspace_id}, configured_workspace_id=${config.workspaceId}`
+    )
+
+    const bootstrapCacheProbe = await request('/api/v1/auth/bootstrap', {
+        headers: {
+            ...authHeaders(token),
+            Accept: 'text/html,application/xhtml+xml',
+        },
+    })
+
+    if (bootstrapCacheProbe.response.status !== 200) {
+        fail(
+            'Auth bootstrap content negotiation',
+            bootstrapCacheProbe.response,
+            `expected 200, body=${JSON.stringify(bootstrapCacheProbe.body)}`
+        )
+    }
+    if (bootstrapCacheProbe.response.headers.get('cache-control') !== 'no-store') {
+        fail(
+            'Auth bootstrap cache-control',
+            bootstrapCacheProbe.response,
+            `expected Cache-Control=no-store, got ${bootstrapCacheProbe.response.headers.get('cache-control')}`
+        )
+    }
+    assertBootstrapPayload(bootstrapCacheProbe.body)
+    logPass('Auth bootstrap cache-control')
+
     await expectStatus('Malformed auth header rejected', '/api/v1/auth/me', 401, {
         headers: {
             Authorization: 'Bearer bad token',
         },
     })
     logPass('Malformed auth header rejected')
+
+    const malformedBootstrap = await request('/api/v1/auth/bootstrap', {
+        headers: {
+            Authorization: 'Bearer bad token',
+        },
+    })
+    if (malformedBootstrap.response.status !== 401) {
+        fail(
+            'Malformed bootstrap auth header rejected',
+            malformedBootstrap.response,
+            `expected 401, body=${JSON.stringify(malformedBootstrap.body)}`
+        )
+    }
+    logPass('Malformed bootstrap auth header rejected')
 }
 
 function buildValidRunnerSchema() {
@@ -273,6 +395,18 @@ async function createTempForm(token) {
         id: body.form.id,
         version: body.form.version,
     }
+}
+
+async function fetchBuildForm(token, formId) {
+    const { response, body } = await request(`/api/v1/build/${config.workspaceId}/forms/${formId}`, {
+        headers: authHeaders(token),
+    })
+
+    if (response.status !== 200 || !body?.form?.version) {
+        fail('Fetch build form', response, `expected 200 with form.version, body=${JSON.stringify(body)}`)
+    }
+
+    return body.form
 }
 
 async function patchFormAccess(token, formId, payload) {
@@ -563,26 +697,53 @@ async function runRunnerChecks(token, form) {
     }
     logPass('Runner protected success submit', `submission_id=${success.body.submission_id}`)
 
-    if (!config.runProtectedFormChecks) {
-        logSkip('Protected-form checks', 'Set FORMSANDBOX_RUN_PROTECTED_FORM_CHECKS=1 to enable')
-        return
+    if (config.runRequireAuthFormChecks) {
+        await expectProtectedRunnerCode(
+            'Runner require_auth blocked',
+            config.requireAuthFormId,
+            'FORM_AUTH_REQUIRED'
+        )
+    } else {
+        logSkip(
+            'Require-auth form checks',
+            'Set FORMSANDBOX_RUN_REQUIRE_AUTH_FORM_CHECKS=1 and FORMSANDBOX_REQUIRE_AUTH_FORM_ID to enable'
+        )
     }
 
-    await expectProtectedRunnerCode(
-        'Runner require_auth blocked',
-        config.requireAuthFormId,
-        'FORM_AUTH_REQUIRED'
-    )
-    await expectProtectedRunnerCode(
-        'Runner password-protected blocked',
-        config.passwordProtectedFormId,
-        'FORM_ACCESS_TOKEN_INVALID'
-    )
-    await expectProtectedRunnerCode(
-        'Runner captcha blocked',
-        config.captchaFormId,
-        'CAPTCHA_REQUIRED'
-    )
+    if (config.runPasswordProtectedFormChecks) {
+        await expectProtectedRunnerCode(
+            'Runner password-protected blocked',
+            config.passwordProtectedFormId,
+            'FORM_ACCESS_TOKEN_INVALID'
+        )
+    } else {
+        logSkip(
+            'Password-protected form checks',
+            'Set FORMSANDBOX_RUN_PASSWORD_PROTECTED_FORM_CHECKS=1 and FORMSANDBOX_PASSWORD_PROTECTED_FORM_ID to enable'
+        )
+    }
+
+    if (config.runCaptchaFormChecks) {
+        await expectProtectedRunnerCode(
+            'Runner captcha blocked',
+            config.captchaFormId,
+            'CAPTCHA_REQUIRED'
+        )
+    } else {
+        logSkip(
+            'Captcha form checks',
+            'Set FORMSANDBOX_RUN_CAPTCHA_FORM_CHECKS=1 and FORMSANDBOX_CAPTCHA_FORM_ID to enable'
+        )
+    }
+
+    if (config.requireAuthProbeFormId) {
+        await runRequireAuthCapabilityProbe(token, config.requireAuthProbeFormId)
+    } else {
+        logSkip(
+            'Require-auth capability probe',
+            'Set FORMSANDBOX_REQUIRE_AUTH_PROBE_FORM_ID to probe builder access support'
+        )
+    }
 }
 
 async function expectProtectedRunnerCode(name, formId, expectedCode) {
@@ -596,6 +757,42 @@ async function expectProtectedRunnerCode(name, formId, expectedCode) {
         fail(name, result.response, `expected 403 ${expectedCode}, body=${JSON.stringify(result.body)}`)
     }
     logPass(name)
+}
+
+async function runRequireAuthCapabilityProbe(token, formId) {
+    const buildForm = await fetchBuildForm(token, formId)
+
+    const probe = await request(`/api/v1/build/${config.workspaceId}/forms/${formId}/access`, {
+        method: 'PATCH',
+        headers: {
+            ...authHeaders(token),
+            'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+            version: buildForm.version,
+            require_auth: true,
+        }),
+    })
+
+    if (probe.response.status === 200) {
+        logPass('Require-auth capability probe', 'builder access route accepted require_auth')
+        return
+    }
+
+    if (
+        probe.response.status === 400
+        && JSON.stringify(probe.body).includes('require_auth')
+        && JSON.stringify(probe.body).includes('unrecognized')
+    ) {
+        logPass('Require-auth capability probe', 'builder access route currently rejects require_auth as unsupported')
+        return
+    }
+
+    fail(
+        'Require-auth capability probe',
+        probe.response,
+        `expected 200 or 400 unsupported-key response, body=${JSON.stringify(probe.body)}`
+    )
 }
 
 async function runStripeChecks(token) {
@@ -661,6 +858,142 @@ async function runStripeChecks(token) {
     logPass('Stripe webhook non-json content type rejected')
 }
 
+async function fetchWorkspaceOverview(token) {
+    return request(`/api/v1/workspaces/${config.workspaceId}/overview`, {
+        headers: authHeaders(token),
+    })
+}
+
+async function fetchWorkspaceSettings(token) {
+    return request(`/api/v1/workspaces/${config.workspaceId}/settings`, {
+        headers: authHeaders(token),
+    })
+}
+
+async function patchWorkspaceSettings(token, payload) {
+    return request(`/api/v1/workspaces/${config.workspaceId}/settings`, {
+        method: 'PATCH',
+        headers: {
+            ...authHeaders(token),
+            'Content-Type': 'application/json',
+        },
+        body: JSON.stringify(payload),
+    })
+}
+
+function assertWorkspaceOverview(body) {
+    if (!body?.workspace?.id || body.workspace.id !== config.workspaceId) {
+        throw new Error('Workspace overview did not return the configured workspace.id')
+    }
+    if (!body?.owner?.id) {
+        throw new Error('Workspace overview did not include owner.id')
+    }
+    if (!body?.membership?.role) {
+        throw new Error('Workspace overview did not include membership.role')
+    }
+    if (typeof body?.summary?.member_count !== 'number') {
+        throw new Error('Workspace overview did not include summary.member_count')
+    }
+    if ('settings' in (body.workspace ?? {})) {
+        throw new Error('Workspace overview exposed raw workspace.settings')
+    }
+    if ('version' in (body.workspace ?? {})) {
+        throw new Error('Workspace overview exposed workspace.version')
+    }
+    if ('retention_days' in (body.workspace ?? {})) {
+        throw new Error('Workspace overview exposed workspace.retention_days')
+    }
+}
+
+async function runWorkspaceChecks(token) {
+    logSection('Workspaces')
+
+    const overview = await fetchWorkspaceOverview(token)
+    if (overview.response.status !== 200) {
+        fail('Workspace overview', overview.response, `expected 200, body=${JSON.stringify(overview.body)}`)
+    }
+    assertWorkspaceOverview(overview.body)
+    logPass('Workspace overview', `role=${overview.body.membership.role}`)
+
+    const settings = await fetchWorkspaceSettings(token)
+    if (settings.response.status !== 200 || !settings.body?.workspace?.version) {
+        fail('Workspace settings read', settings.response, `expected 200, body=${JSON.stringify(settings.body)}`)
+    }
+    logPass('Workspace settings read', `version=${settings.body.workspace.version}`)
+
+    const baseline = settings.body
+    const originalVersion = baseline.workspace.version
+    const originalSettings = baseline.settings ?? {}
+    const originalTagline = originalSettings?.about?.tagline ?? null
+    const updatedTagline = `Validation ${Date.now()}`
+
+    const updateResult = await patchWorkspaceSettings(token, {
+        version: originalVersion,
+        settings: {
+            about: {
+                tagline: updatedTagline,
+            },
+        },
+    })
+
+    if (updateResult.response.status !== 200 || updateResult.body?.settings?.about?.tagline !== updatedTagline) {
+        fail('Workspace settings patch', updateResult.response, `expected 200, body=${JSON.stringify(updateResult.body)}`)
+    }
+    logPass('Workspace settings patch', `version=${updateResult.body.workspace.version}`)
+
+    const conflictResult = await patchWorkspaceSettings(token, {
+        version: originalVersion,
+        settings: {
+            about: {
+                tagline: `${updatedTagline}-stale`,
+            },
+        },
+    })
+
+    if (conflictResult.response.status !== 409 || typeof conflictResult.body?.current_version !== 'number') {
+        fail('Workspace settings version conflict', conflictResult.response, `expected 409, body=${JSON.stringify(conflictResult.body)}`)
+    }
+    logPass('Workspace settings version conflict')
+
+    const invalidResult = await patchWorkspaceSettings(token, {
+        version: updateResult.body.workspace.version,
+        settings: {
+            about: {
+                unknown_field: 'x',
+            },
+        },
+    })
+
+    if (invalidResult.response.status !== 400) {
+        fail('Workspace settings invalid nested key rejected', invalidResult.response, `expected 400, body=${JSON.stringify(invalidResult.body)}`)
+    }
+    logPass('Workspace settings invalid nested key rejected')
+
+    if (config.viewerAccessToken) {
+        const viewerSettings = await fetchWorkspaceSettings(config.viewerAccessToken)
+        if (viewerSettings.response.status !== 403) {
+            fail('Workspace settings non-owner denied', viewerSettings.response, `expected 403, body=${JSON.stringify(viewerSettings.body)}`)
+        }
+        logPass('Workspace settings non-owner denied')
+    } else {
+        logSkip('Workspace settings non-owner denied', 'Set FORMSANDBOX_VIEWER_ACCESS_TOKEN to enable')
+    }
+
+    const restoreResult = await patchWorkspaceSettings(token, {
+        version: updateResult.body.workspace.version,
+        settings: {
+            about: {
+                tagline: originalTagline,
+            },
+        },
+    })
+
+    if (restoreResult.response.status !== 200) {
+        fail('Workspace settings restore', restoreResult.response, `expected 200, body=${JSON.stringify(restoreResult.body)}`)
+    }
+    logPass('Workspace settings restore', `version=${restoreResult.body.workspace.version}`)
+}
+
 async function main() {
     assertConfig()
 
@@ -672,6 +1005,12 @@ async function main() {
         const tempForm = await runBuildChecks(token)
         tempFormId = tempForm.id
         await runRunnerChecks(token, tempForm)
+
+        if (config.runWorkspaceChecks) {
+            await runWorkspaceChecks(token)
+        } else {
+            logSkip('Workspace checks', 'Set FORMSANDBOX_RUN_WORKSPACE_CHECKS=1 to enable')
+        }
 
         if (config.runStripeChecks) {
             await runStripeChecks(token)

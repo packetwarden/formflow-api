@@ -42,6 +42,10 @@ We utilize a RESTful design optimized through Hono's `app.route()` grouping feat
 | **POST** | `/api/v1/auth/logout` | Invalidate current session. | Yes (Bearer) |
 | **GET** | `/api/v1/auth/bootstrap` | Fetch frontend bootstrap state: curated user, visible workspaces, and current workspace id. | Yes (Bearer) |
 | **GET** | `/api/v1/auth/me` | Fetch the current authenticated user's profile. | Yes (Bearer) |
+| **Workspace Group (`/api/v1/workspaces/:workspaceId/*`)** |  |  |  |
+| **GET** | `/api/v1/workspaces/:workspaceId/overview` | Fetch member-visible workspace summary, owner details, caller role, and safe workspace settings. | Yes (Bearer) |
+| **GET** | `/api/v1/workspaces/:workspaceId/settings` | Fetch owner-only editable workspace settings document with optimistic-lock version. | Yes (Bearer, owner only) |
+| **PATCH** | `/api/v1/workspaces/:workspaceId/settings` | Update owner-only workspace metadata and typed settings namespaces using optimistic locking. | Yes (Bearer, owner only) |
 | **Builder Group (`/api/v1/build/:workspaceId/*`)** |  |  |  |
 | **GET** | `/api/v1/build/:workspaceId/forms` | Fetch all forms belonging to the workspace. | Yes (Bearer) |
 | **GET** | `/api/v1/build/:workspaceId/forms/:formId` | Fetch the draft `schema` JSONB for the editor. | Yes (Bearer) |

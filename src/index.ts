@@ -7,6 +7,7 @@ import authRouter from './routes/auth'
 import buildRouter from './routes/build'
 import runnerRouter from './routes/f'
 import stripeRouter, { runStripeScheduled } from './routes/stripe'
+import workspacesRouter from './routes/workspaces'
 
 const app = new Hono<{ Bindings: Env }>()
 
@@ -22,6 +23,7 @@ app.route('/api/v1/auth', authRouter)
 app.route('/api/v1/build', buildRouter)
 app.route('/api/v1/f', runnerRouter)
 app.route('/api/v1/stripe', stripeRouter)
+app.route('/api/v1/workspaces', workspacesRouter)
 
 app.get('/', (c) => {
     return c.text('FormSandbox (FormFlow) API Edge Runtime')

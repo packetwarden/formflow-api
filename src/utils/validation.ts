@@ -12,6 +12,9 @@ const MAX_CAPTCHA_TOKEN_LENGTH = 4096
 const MAX_FORM_ACCESS_TOKEN_LENGTH = 2048
 const MAX_STARTED_AT_FUTURE_SKEW_MS = 5 * 60 * 1000
 const MAX_STARTED_AT_AGE_MS = 30 * 24 * 60 * 60 * 1000
+const MAX_WORKSPACE_TAGLINE_LENGTH = 160
+const MAX_LOCALE_LENGTH = 64
+const MAX_TIMEZONE_LENGTH = 128
 
 const trimToUndefined = (value: unknown) => {
     if (typeof value !== 'string') return value
@@ -129,6 +132,62 @@ export const absoluteHttpUrlSchema = z
 export const clearableAbsoluteHttpUrlSchema = z.preprocess(
     trimToNull,
     z.union([absoluteHttpUrlSchema, z.null()])
+)
+
+const hexColorSchema = z
+    .string()
+    .trim()
+    .regex(/^#[0-9a-fA-F]{6}$/, 'Color must be a valid 6-digit hex value')
+    .transform((value) => value.toUpperCase())
+
+const clearableHexColorSchema = z.preprocess(
+    trimToNull,
+    z.union([hexColorSchema, z.null()])
+)
+
+const localeSchema = z
+    .string()
+    .trim()
+    .min(2, 'default_locale must be at least 2 characters long')
+    .max(MAX_LOCALE_LENGTH, `default_locale must be at most ${MAX_LOCALE_LENGTH} characters`)
+    .transform((value, ctx) => {
+        try {
+            return Intl.getCanonicalLocales(value)[0]
+        } catch {
+            ctx.addIssue({
+                code: 'custom',
+                message: 'default_locale must be a valid locale tag',
+            })
+            return z.NEVER
+        }
+    })
+
+const clearableLocaleSchema = z.preprocess(
+    trimToNull,
+    z.union([localeSchema, z.null()])
+)
+
+const timezoneSchema = z
+    .string()
+    .trim()
+    .min(1, 'default_timezone is required')
+    .max(MAX_TIMEZONE_LENGTH, `default_timezone must be at most ${MAX_TIMEZONE_LENGTH} characters`)
+    .transform((value, ctx) => {
+        try {
+            new Intl.DateTimeFormat('en-US', { timeZone: value }).format(new Date())
+            return value
+        } catch {
+            ctx.addIssue({
+                code: 'custom',
+                message: 'default_timezone must be a valid IANA timezone identifier',
+            })
+            return z.NEVER
+        }
+    })
+
+const clearableTimezoneSchema = z.preprocess(
+    trimToNull,
+    z.union([timezoneSchema, z.null()])
 )
 
 const bearerTokenSchema = z
@@ -393,6 +452,17 @@ const formTitleSchema = z
     .min(1, 'title is required')
     .max(200, 'title must be at most 200 characters')
 
+const workspaceNameSchema = z
+    .string()
+    .trim()
+    .min(1, 'name is required')
+    .max(100, 'name must be at most 100 characters')
+
+const workspaceTaglineSchema = z
+    .string()
+    .trim()
+    .max(MAX_WORKSPACE_TAGLINE_LENGTH, `tagline must be at most ${MAX_WORKSPACE_TAGLINE_LENGTH} characters`)
+
 const nullablePositiveIntegerSchema = z.union([
     z.number().int().positive('max_submissions must be greater than 0'),
     z.null(),
@@ -456,6 +526,49 @@ export const updateFormAccessSchema = z
         }
     )
 
+export const workspaceSettingsSchema = z.object({
+    about: z.object({
+        tagline: z.preprocess(
+            trimToNull,
+            z.union([workspaceTaglineSchema, z.null()])
+        ).optional(),
+        website_url: clearableAbsoluteHttpUrlSchema.optional(),
+        support_email: z.preprocess(
+            trimToNull,
+            z.union([normalizedEmailSchema, z.null()])
+        ).optional(),
+        support_url: clearableAbsoluteHttpUrlSchema.optional(),
+    }).strict().optional(),
+    branding: z.object({
+        primary_color: clearableHexColorSchema.optional(),
+        accent_color: clearableHexColorSchema.optional(),
+    }).strict().optional(),
+    preferences: z.object({
+        default_locale: clearableLocaleSchema.optional(),
+        default_timezone: clearableTimezoneSchema.optional(),
+    }).strict().optional(),
+}).strict()
+
+export const updateWorkspaceSettingsSchema = z
+    .object({
+        version: z.number().int().min(1, 'version must be an integer >= 1'),
+        name: workspaceNameSchema.optional(),
+        description: clearableTextSchema(MAX_DESCRIPTION_LENGTH, 'description').optional(),
+        logo_url: clearableAbsoluteHttpUrlSchema.optional(),
+        settings: workspaceSettingsSchema.optional(),
+    })
+    .strict()
+    .refine(
+        (value) =>
+            value.name !== undefined ||
+            value.description !== undefined ||
+            value.logo_url !== undefined ||
+            value.settings !== undefined,
+        {
+            message: 'At least one editable field must be provided',
+        }
+    )
+
 export const parseBearerAuthorizationHeader = (authorization: string | undefined) =>
     bearerAuthHeaderSchema.safeParse({ authorization })
 
@@ -478,6 +591,8 @@ export type PublishFormInput = z.infer<typeof publishFormSchema>
 export type CreateFormInput = z.infer<typeof createFormSchema>
 export type UpdateFormMetaInput = z.infer<typeof updateFormMetaSchema>
 export type UpdateFormAccessInput = z.infer<typeof updateFormAccessSchema>
+export type WorkspaceSettingsInput = z.infer<typeof workspaceSettingsSchema>
+export type UpdateWorkspaceSettingsSchemaInput = z.infer<typeof updateWorkspaceSettingsSchema>
 export type BuildSubmissionListQueryInput = z.infer<typeof buildSubmissionListQuerySchema>
 export type RunnerSubmitBodyInput = z.infer<typeof runnerSubmitBodySchema>
 export type RunnerIdempotencyHeaderInput = z.infer<typeof runnerIdempotencyHeaderSchema>

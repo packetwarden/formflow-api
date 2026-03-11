@@ -8,7 +8,8 @@
         "dev": "wrangler dev",
         "deploy": "wrangler deploy",
         "cf-typegen": "wrangler types",
-        "test:validation:live": "node scripts/server-side-validation-check.mjs"
+        "test:validation:live": "node scripts/server-side-validation-check.mjs",
+        "test:bootstrap:attack": "node scripts/auth-bootstrap-attack-check.mjs"
     },
     "dependencies": {
         "@hono/zod-validator": "^0.7.6",
