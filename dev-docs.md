@@ -128,19 +128,22 @@ Error contract:
 Compatibility:
 1. `GET /api/v1/auth/me` remains unchanged and still returns only `{ user }`
 
-### 6.2 Workspace Overview and Settings API
-Purpose: expose workspace-safe member-visible metadata plus a separate owner-only settings document for admin editing.
+### 6.2 Workspace Overview, Billing, and Settings API
+Purpose: expose workspace-safe member-visible metadata, billing summary state, and a separate owner-only settings document for admin editing.
 
 Routes:
 1. `GET /api/v1/workspaces/:workspaceId/overview`
-2. `GET /api/v1/workspaces/:workspaceId/settings`
-3. `PATCH /api/v1/workspaces/:workspaceId/settings`
+2. `GET /api/v1/workspaces/:workspaceId/billing`
+3. `GET /api/v1/workspaces/:workspaceId/settings`
+4. `PATCH /api/v1/workspaces/:workspaceId/settings`
 
 Authorization model:
 1. all routes are protected by `requireAuth`
 2. overview is readable by any visible workspace member (`owner`, `admin`, `editor`, `viewer`)
-3. settings read/write routes are owner-only
-4. authorization is enforced twice:
+3. billing summary is readable by any visible workspace member (`owner`, `admin`, `editor`, `viewer`)
+4. billing management actions are advertised only to `owner` / `admin`
+5. settings read/write routes are owner-only
+6. authorization is enforced twice:
    - Worker route guard in `src/utils/workspace-access.ts`
    - Postgres RLS owner-only `UPDATE` policy on `public.workspaces`
 
@@ -158,6 +161,26 @@ Overview contract (`GET /api/v1/workspaces/:workspaceId/overview`):
    - `retention_days`
    - Stripe/billing internals
    - owner email
+
+Billing summary contract (`GET /api/v1/workspaces/:workspaceId/billing`):
+1. uses request-scoped authenticated Supabase client with caller bearer token
+2. reads `subscriptions`, `plans`, and `plan_variants` only through authenticated RLS-safe selects
+3. returns:
+   - `workspace.id`
+   - `workspace.role`
+   - `billing.effective_plan` derived from entitled subscription statuses only (`active`, `trialing`, `past_due`)
+   - `billing.subscription` as the most relevant visible subscription row
+   - `billing.history` with `provider = "stripe_portal"` and availability flag
+   - `billing.actions` with route descriptors for existing hosted Stripe POST endpoints
+4. member-visible billing summary intentionally excludes:
+   - raw `stripe_customer_id`
+   - raw `stripe_subscription_id`
+   - webhook metadata
+   - service-role-only billing tables
+5. summary route never calls Stripe APIs and never creates checkout or portal sessions directly
+6. `portal_session` action is present only for `owner` / `admin` when billing history is available
+7. `checkout_session` action is present only for `owner` / `admin` when effective plan is `free` and self-serve paid variants are active
+8. sets `Cache-Control: no-store`
 
 Settings document contract (`GET /api/v1/workspaces/:workspaceId/settings`):
 1. owner-only
@@ -768,6 +791,7 @@ Checkout + portal behavior:
    - `invalidated`
    - `recreated`
    - `webhook_deleted`
+14. portal session recovery prefers the latest subscription-linked `stripe_customer_id` before falling back to mapping recreation, preserving access to Stripe-hosted billing history when mapping drift occurs
 
 Catalog sync behavior:
 1. Stripe is source-of-truth for recurring sellable prices

@@ -5,6 +5,7 @@ import { requireAuth } from '../../middlewares/auth'
 import { buildWriteRateLimit } from '../../middlewares/rate-limit'
 import {
     getAuthScopedSupabaseClient,
+    loadWorkspaceBillingSummary,
     loadWorkspaceOverview,
     loadWorkspaceSettingsDocument,
     mergeWorkspaceSettings,
@@ -26,6 +27,19 @@ workspacesRouter.get(
         if (!overview.ok) return overview.response
 
         return c.json(overview.overview, 200)
+    }
+)
+
+workspacesRouter.get(
+    '/:workspaceId/billing',
+    zValidator('param', workspaceParamSchema),
+    async (c) => {
+        const { workspaceId } = c.req.valid('param')
+        const billing = await loadWorkspaceBillingSummary(c, workspaceId)
+        if (!billing.ok) return billing.response
+
+        c.header('Cache-Control', 'no-store')
+        return c.json(billing.billing, 200)
     }
 )
 

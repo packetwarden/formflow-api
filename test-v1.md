@@ -13,20 +13,21 @@ This guide covers testing core API routes:
 5. `GET /api/v1/auth/me`
 6. `POST /api/v1/auth/logout`
 7. `GET /api/v1/workspaces/:workspaceId/overview`
-8. `GET /api/v1/workspaces/:workspaceId/settings`
-9. `PATCH /api/v1/workspaces/:workspaceId/settings`
-10. `GET /api/v1/build/:workspaceId/forms`
-11. `POST /api/v1/build/:workspaceId/forms`
-12. `GET /api/v1/build/:workspaceId/forms/:formId`
-13. `PATCH /api/v1/build/:workspaceId/forms/:formId`
-14. `PATCH /api/v1/build/:workspaceId/forms/:formId/access`
-15. `PUT /api/v1/build/:workspaceId/forms/:formId`
-16. `POST /api/v1/build/:workspaceId/forms/:formId/publish`
-17. `DELETE /api/v1/build/:workspaceId/forms/:formId`
-18. `GET /api/v1/f/:formId/schema`
-19. `POST /api/v1/f/:formId/access`
-20. `POST /api/v1/f/:formId/submit`
-21. `POST /api/v1/stripe/workspaces/:workspaceId/checkout-session`
+8. `GET /api/v1/workspaces/:workspaceId/billing`
+9. `GET /api/v1/workspaces/:workspaceId/settings`
+10. `PATCH /api/v1/workspaces/:workspaceId/settings`
+11. `GET /api/v1/build/:workspaceId/forms`
+12. `POST /api/v1/build/:workspaceId/forms`
+13. `GET /api/v1/build/:workspaceId/forms/:formId`
+14. `PATCH /api/v1/build/:workspaceId/forms/:formId`
+15. `PATCH /api/v1/build/:workspaceId/forms/:formId/access`
+16. `PUT /api/v1/build/:workspaceId/forms/:formId`
+17. `POST /api/v1/build/:workspaceId/forms/:formId/publish`
+18. `DELETE /api/v1/build/:workspaceId/forms/:formId`
+19. `GET /api/v1/f/:formId/schema`
+20. `POST /api/v1/f/:formId/access`
+21. `POST /api/v1/f/:formId/submit`
+22. `POST /api/v1/stripe/workspaces/:workspaceId/checkout-session`
 
 Stripe billing has a dedicated deep-dive matrix in `test-stripe-v1.md`.
 
@@ -181,6 +182,7 @@ pm.test("Status is not 401", function () {
 | GET | `/api/v1/auth/me` | Yes | `200` |
 | POST | `/api/v1/auth/logout` | Yes | `200` |
 | GET | `/api/v1/workspaces/:workspaceId/overview` | Yes | `200` / `401` / `404` / `500` |
+| GET | `/api/v1/workspaces/:workspaceId/billing` | Yes | `200` / `401` / `404` / `500` |
 | GET | `/api/v1/workspaces/:workspaceId/settings` | Yes (owner only) | `200` / `401` / `403` / `404` / `500` |
 | PATCH | `/api/v1/workspaces/:workspaceId/settings` | Yes (owner only) | `200` / `400` / `401` / `403` / `404` / `409` / `500` |
 | GET | `/api/v1/build/:workspaceId/forms` | Yes | `200` / `404` |
@@ -298,7 +300,36 @@ pm.expect(json.membership.role).to.be.a("string");
 pm.expect(json.summary.member_count).to.be.a("number");
 ```
 
-### 7.4C Workspace Settings Read (`/workspaces/:workspaceId/settings`)
+### 7.4C Workspace Billing Summary (`/workspaces/:workspaceId/billing`)
+Request:
+1. Method: `GET`
+2. URL: `{{base_url}}/api/v1/workspaces/{{workspace_id}}/billing`
+3. Headers: `Authorization: Bearer {{access_token}}`
+
+Expected:
+1. `200`
+2. JSON has `workspace.id = {{workspace_id}}`
+3. JSON has `workspace.role`
+4. JSON has `billing.effective_plan`
+5. JSON has `billing.history.provider = "stripe_portal"`
+6. Response header `Cache-Control` is `no-store`
+7. JSON does not expose raw Stripe identifiers
+
+Tests tab:
+```javascript
+pm.test("Workspace billing fetch success", function () {
+  pm.expect(pm.response.code).to.eql(200);
+});
+
+const json = pm.response.json();
+pm.expect(json.workspace.id).to.eql(pm.environment.get("workspace_id"));
+pm.expect(json.workspace.role).to.be.a("string");
+pm.expect(json.billing.history.provider).to.eql("stripe_portal");
+pm.expect(JSON.stringify(json)).to.not.include("stripe_customer_id");
+pm.expect(JSON.stringify(json)).to.not.include("stripe_subscription_id");
+```
+
+### 7.4D Workspace Settings Read (`/workspaces/:workspaceId/settings`)
 Request:
 1. Method: `GET`
 2. URL: `{{base_url}}/api/v1/workspaces/{{workspace_id}}/settings`
@@ -319,7 +350,7 @@ const json = pm.response.json();
 pm.environment.set("workspace_version", json.workspace.version);
 ```
 
-### 7.4D Workspace Settings Patch (`/workspaces/:workspaceId/settings`)
+### 7.4E Workspace Settings Patch (`/workspaces/:workspaceId/settings`)
 Request:
 1. Method: `PATCH`
 2. URL: `{{base_url}}/api/v1/workspaces/{{workspace_id}}/settings`
@@ -353,8 +384,8 @@ const json = pm.response.json();
 pm.environment.set("workspace_version", json.workspace.version);
 ```
 
-### 7.4E Workspace Settings Patch Conflict
-Use the same request as 7.4D with an older `workspace_version`.
+### 7.4F Workspace Settings Patch Conflict
+Use the same request as 7.4E with an older `workspace_version`.
 
 Expected:
 1. `409`
@@ -581,12 +612,15 @@ Expected:
 24. Malformed `Authorization` header on `/auth/bootstrap`, `/auth/me`, or `/auth/logout` -> `401`
 25. Authenticated user with zero visible workspaces on `/auth/bootstrap` -> `409 WORKSPACE_BOOTSTRAP_EMPTY`
 26. Non-member `GET /workspaces/:workspaceId/overview` -> `404`
-27. Viewer `GET /workspaces/:workspaceId/settings` -> `403`
-28. Viewer `PATCH /workspaces/:workspaceId/settings` -> `403`
-29. Workspace settings patch with stale `version` -> `409`
-30. Workspace settings patch with unknown nested key -> `400`
-31. Workspace settings patch with invalid URL/color/email/timezone -> `400`
-32. Workspace overview response must not expose raw `settings`, `version`, `retention_days`, or billing internals
+27. Non-member `GET /workspaces/:workspaceId/billing` -> `404`
+28. Viewer `GET /workspaces/:workspaceId/billing` -> `200` with `actions.can_manage_billing = false`
+29. Viewer `GET /workspaces/:workspaceId/settings` -> `403`
+30. Viewer `PATCH /workspaces/:workspaceId/settings` -> `403`
+31. Workspace settings patch with stale `version` -> `409`
+32. Workspace settings patch with unknown nested key -> `400`
+33. Workspace settings patch with invalid URL/color/email/timezone -> `400`
+34. Workspace overview response must not expose raw `settings`, `version`, `retention_days`, or billing internals
+35. Workspace billing response must not expose raw `stripe_customer_id`, `stripe_subscription_id`, or service-role-only billing tables
 
 ### 8.1 Security SQL Audit Snippets
 Search-path hardening audit (expect zero rows):

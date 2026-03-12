@@ -80,6 +80,12 @@ type ExistingSubscriptionRow = {
     plan_id: string
     plan_variant_id: string
 }
+type WorkspaceStripeCustomerPreferenceRow = {
+    id: string
+    stripe_customer_id: string
+    created_at: string
+    last_stripe_event_created_at: string | null
+}
 type WebhookEventRow = {
     event_id: string
 }
@@ -221,6 +227,15 @@ const createCorrelationId = () => crypto.randomUUID()
 
 const digestSha256 = async (value: string) => {
     return new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(value)))
+}
+
+const compareIsoDesc = (left: string, right: string) => right.localeCompare(left)
+
+const compareNullableIsoDesc = (left: string | null, right: string | null) => {
+    if (left === right) return 0
+    if (!left) return 1
+    if (!right) return -1
+    return right.localeCompare(left)
 }
 
 const timingSafeEqual = async (left: string, right: string) => {
@@ -476,6 +491,33 @@ const findEntitledPaidSubscription = async (env: Env, workspaceId: string) => {
         const slug = Array.isArray(plan) ? plan[0]?.slug : plan?.slug
         return slug !== FREE_PLAN_SLUG
     }) ?? null
+}
+
+const findLatestWorkspaceStripeCustomerId = async (env: Env, workspaceId: string) => {
+    const supabase = getServiceSupabase(env)
+    const { data: rows, error } = await supabase
+        .from('subscriptions')
+        .select('id, stripe_customer_id, created_at, last_stripe_event_created_at')
+        .eq('workspace_id', workspaceId)
+        .not('stripe_customer_id', 'is', null)
+        .returns<WorkspaceStripeCustomerPreferenceRow[]>()
+
+    if (error) throw new Error(`Failed to resolve latest workspace Stripe customer: ${error.message}`)
+
+    const sortedRows = [...(rows ?? [])].sort((left, right) => {
+        const byEventCreatedAt = compareNullableIsoDesc(
+            left.last_stripe_event_created_at,
+            right.last_stripe_event_created_at
+        )
+        if (byEventCreatedAt !== 0) return byEventCreatedAt
+
+        const byCreatedAt = compareIsoDesc(left.created_at, right.created_at)
+        if (byCreatedAt !== 0) return byCreatedAt
+
+        return right.id.localeCompare(left.id)
+    })
+
+    return sortedRows[0]?.stripe_customer_id ?? null
 }
 
 const getCheckoutIdempotencyRow = async (
@@ -2203,6 +2245,7 @@ stripeRouter.post(
 
         try {
             const stripe = getStripeClient(c.env)
+            const preferredCustomerId = await findLatestWorkspaceStripeCustomerId(c.env, workspaceId)
             const session = await withRecoveredWorkspaceStripeCustomer(
                 c.env,
                 workspaceId,
@@ -2212,6 +2255,7 @@ stripeRouter.post(
                     requestScopeKey: correlationId,
                     correlationId,
                     operation: 'portal-session',
+                    preferredCustomerId,
                 },
                 async (customerId) => stripe.billingPortal.sessions.create({
                     customer: customerId,

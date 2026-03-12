@@ -2,23 +2,25 @@
 
 Version: v5  
 Last Updated: March 4, 2026  
-Target: Cloudflare Worker deployment (`/api/v1/stripe/*`)
+Target: Cloudflare Worker deployment (`/api/v1/workspaces/*`, `/api/v1/stripe/*`)
 
 ## 1. Scope
 This guide covers Stripe billing endpoint testing:
-1. `POST /api/v1/stripe/workspaces/:workspaceId/checkout-session`
-2. `POST /api/v1/stripe/workspaces/:workspaceId/portal-session`
-3. `POST /api/v1/stripe/webhook`
+1. `GET /api/v1/workspaces/:workspaceId/billing`
+2. `POST /api/v1/stripe/workspaces/:workspaceId/checkout-session`
+3. `POST /api/v1/stripe/workspaces/:workspaceId/portal-session`
+4. `POST /api/v1/stripe/webhook`
 
 This guide validates:
 1. owner/admin authorization on billing routes
-2. hosted checkout creation for `pro` and `business`
-3. enterprise self-serve rejection behavior
-4. billing portal creation behavior
-5. webhook signature verification
-6. webhook idempotency, authoritative subscription sync, and trigger-coupled workspace plan cache sync
-7. payment failure grace-period behavior and recovery
-8. retry and scheduled downgrade flows
+2. member-visible workspace billing summary behavior
+3. hosted checkout creation for `pro` and `business`
+4. enterprise self-serve rejection behavior
+5. billing portal creation behavior
+6. webhook signature verification
+7. webhook idempotency, authoritative subscription sync, and trigger-coupled workspace plan cache sync
+8. payment failure grace-period behavior and recovery
+9. retry and scheduled downgrade flows
 
 ## 2. Prerequisites
 Before running tests:
@@ -157,12 +159,45 @@ if (!pm.environment.get("checkout_idempotency_key")) {
 ## 6. Endpoint Matrix
 | Method | Endpoint | Auth | Expected |
 |---|---|---|---|
+| GET | `/api/v1/workspaces/:workspaceId/billing` | Yes (member-readable; owner/admin manage) | `200` / `401` / `404` / `500` |
 | POST | `/api/v1/stripe/workspaces/:workspaceId/checkout-session` | Yes (owner/admin + `Idempotency-Key`) | `200` / `400` / `403` / `404` / `409` / `500` |
 | POST | `/api/v1/stripe/workspaces/:workspaceId/portal-session` | Yes (owner/admin) | `200` / `403` / `404` / `500` |
 | POST | `/api/v1/stripe/webhook` | No (signature required) | `200` / `400` / `500` |
 | POST | `/api/v1/stripe/catalog/sync` | Internal token (`x-internal-admin-token` or Bearer token) | `200` / `403` / `500` |
 
 ## 7. Detailed Postman + Stripe Tests
+
+### 7.0 Workspace Billing Summary
+Flow:
+1. Call `GET {{base_url}}/api/v1/workspaces/{{workspace_id_free}}/billing` as workspace owner on a brand-new free workspace.
+2. Call the same endpoint as a `viewer` member.
+3. Call `GET {{base_url}}/api/v1/workspaces/{{workspace_id_paid}}/billing` as an `admin` on a paid workspace.
+4. Call `GET {{base_url}}/api/v1/workspaces/{{workspace_id_free}}/billing` for a free workspace with historical canceled Stripe billing.
+
+Expected:
+1. every success response returns `200` with `Cache-Control: no-store`
+2. member-visible payload includes:
+   - `workspace.id`
+   - `workspace.role`
+   - `billing.effective_plan`
+   - `billing.history.provider = "stripe_portal"`
+3. viewer response returns `actions.can_manage_billing = false` and both action descriptors are `null`
+4. brand-new free owner response returns:
+   - `billing.effective_plan = "free"`
+   - `billing.subscription = null`
+   - `billing.history.available = false`
+   - `billing.actions.checkout_session.available_plans` for active self-serve variants
+5. paid admin response returns:
+   - entitled `billing.subscription`
+   - `billing.history.available = true`
+   - `billing.actions.portal_session` present
+   - `billing.actions.checkout_session = null`
+6. historical canceled-billing free workspace returns:
+   - `billing.effective_plan = "free"`
+   - `billing.history.available = true`
+   - `billing.actions.portal_session` present
+   - `billing.actions.checkout_session` present
+7. payload never exposes raw `stripe_customer_id` or `stripe_subscription_id`
 
 ### 7.1 Checkout Session (free workspace -> `pro monthly`)
 Request:
@@ -587,6 +622,23 @@ Expected:
 2. mapping is recreated to a valid customer
 3. `workspace_billing_customer_events` logs recovery sequence
 
+### 7.26B Historical Subscription Customer Preferred for Portal Recovery
+Flow:
+1. Pick a workspace that has historical Stripe billing and at least one `subscriptions.stripe_customer_id`.
+2. Delete the matching row from `workspace_billing_customers` without touching the historical subscription row:
+```sql
+DELETE FROM public.workspace_billing_customers
+WHERE workspace_id = '<workspace_id_with_history>';
+```
+3. Call:
+   - `POST {{base_url}}/api/v1/stripe/workspaces/{{workspace_id_with_history}}/portal-session`
+
+Expected:
+1. response is `200` with portal URL
+2. worker prefers the latest subscription-linked customer before falling back to blank-customer creation
+3. invoice history remains available in Stripe-hosted portal for that historical workspace
+4. if the historical customer is still valid, no unnecessary replacement customer is created
+
 ### 7.27 `customer.deleted` Webhook Handling
 Flow:
 1. Delete a mapped customer from Stripe Dashboard test mode.
@@ -844,28 +896,30 @@ WHERE w.id = '<workspace_id_under_test>';
 ```
 
 ## 8. Negative Tests Checklist
-1. Missing auth header on checkout/portal -> `401`
-2. Invalid `workspaceId` UUID -> `400`
-3. Non-member workspace access -> `403`
-4. Viewer tries checkout/portal -> `403`
-5. `plan_slug = enterprise` -> `403 CONTACT_SALES_REQUIRED`
-6. `plan_slug = free` -> `400 INVALID_PLAN_FOR_CHECKOUT`
-7. invalid interval value -> `400`
-8. missing `Idempotency-Key` on checkout -> `400 FIELD_VALIDATION_FAILED`
-9. same key + different payload -> `409 IDEMPOTENCY_KEY_REUSED_WITH_DIFFERENT_PAYLOAD`
-10. same key after expiry -> `409 IDEMPOTENCY_KEY_EXPIRED`
-11. missing webhook signature -> `400`
-12. invalid webhook signature -> `400`
-13. oversized webhook body -> `413`
-14. duplicate webhook replay -> `200` and no duplicate side effects
-15. `/api/v1/stripe/catalog/sync` without internal token -> `403`
-16. `/api/v1/stripe/catalog/sync` with mismatched `x-internal-admin-token` and Bearer token -> `403`
-17. missing `STRIPE_INTERNAL_ADMIN_TOKEN` on `/api/v1/stripe/catalog/sync` -> `500 BILLING_CONFIG_MISSING`
-18. malformed billing return/success/cancel URL env -> `500 BILLING_CONFIG_MISSING`
-19. webhook with non-JSON content type -> `400`
-20. missing `STRIPE_WEBHOOK_SIGNING_SECRET` -> `500 BILLING_CONFIG_MISSING`
-21. catalog sync does not repair missing/deleted Stripe customer mappings
-22. `invoice.created` (valid signature) -> `200` with `ack_only = true` and no durable queue insert
+1. Missing auth header on workspace billing summary -> `401`
+2. Missing auth header on checkout/portal -> `401`
+3. Invalid `workspaceId` UUID -> `400`
+4. Non-member workspace billing summary -> `404`
+5. Viewer billing summary returns `200` with `can_manage_billing = false`
+6. Viewer tries checkout/portal -> `403`
+7. `plan_slug = enterprise` -> `403 CONTACT_SALES_REQUIRED`
+8. `plan_slug = free` -> `400 INVALID_PLAN_FOR_CHECKOUT`
+9. invalid interval value -> `400`
+10. missing `Idempotency-Key` on checkout -> `400 FIELD_VALIDATION_FAILED`
+11. same key + different payload -> `409 IDEMPOTENCY_KEY_REUSED_WITH_DIFFERENT_PAYLOAD`
+12. same key after expiry -> `409 IDEMPOTENCY_KEY_EXPIRED`
+13. missing webhook signature -> `400`
+14. invalid webhook signature -> `400`
+15. oversized webhook body -> `413`
+16. duplicate webhook replay -> `200` and no duplicate side effects
+17. `/api/v1/stripe/catalog/sync` without internal token -> `403`
+18. `/api/v1/stripe/catalog/sync` with mismatched `x-internal-admin-token` and Bearer token -> `403`
+19. missing `STRIPE_INTERNAL_ADMIN_TOKEN` on `/api/v1/stripe/catalog/sync` -> `500 BILLING_CONFIG_MISSING`
+20. malformed billing return/success/cancel URL env -> `500 BILLING_CONFIG_MISSING`
+21. webhook with non-JSON content type -> `400`
+22. missing `STRIPE_WEBHOOK_SIGNING_SECRET` -> `500 BILLING_CONFIG_MISSING`
+23. catalog sync does not repair missing/deleted Stripe customer mappings
+24. `invoice.created` (valid signature) -> `200` with `ack_only = true` and no durable queue insert
 
 ## 9. Expected Response Shapes
 Checkout success (`200`):
@@ -890,6 +944,43 @@ Portal success (`200`):
 ```json
 {
   "url": "https://billing.stripe.com/p/session/..."
+}
+```
+
+Workspace billing summary success (`200`):
+```json
+{
+  "workspace": {
+    "id": "uuid",
+    "role": "owner"
+  },
+  "billing": {
+    "effective_plan": "free",
+    "subscription": null,
+    "history": {
+      "provider": "stripe_portal",
+      "available": false
+    },
+    "actions": {
+      "can_manage_billing": true,
+      "portal_session": null,
+      "checkout_session": {
+        "method": "POST",
+        "path": "/api/v1/stripe/workspaces/uuid/checkout-session",
+        "requires_idempotency_key": true,
+        "available_plans": [
+          {
+            "plan_slug": "pro",
+            "plan_name": "Pro",
+            "interval": "monthly",
+            "amount_cents": 2900,
+            "currency": "usd",
+            "trial_period_days": 14
+          }
+        ]
+      }
+    }
+  }
 }
 ```
 
@@ -946,25 +1037,26 @@ Checkout internal failure (`500`):
 ## 10. Recommended Smoke Sequence
 Run in this order:
 1. Login and capture `access_token`
-2. Checkout success on free workspace (`7.1`)
-3. Checkout idempotency replay/expiry suite (`7.17`, `7.18`, `7.19`)
-4. Complete checkout on Stripe-hosted page
-5. Verify webhook + subscription sync (`7.9`)
-6. Re-call checkout for paid workspace (`7.5`)
-7. Portal session success (`7.6`)
-8. Payment failed/recovery (`7.11`, `7.12`)
-9. Payment-action-required grace behavior (`7.32`)
-10. Pending status lifecycle checks (`7.29`, `7.30`)
-11. Pause/resume entitlement lifecycle (`7.33`, `7.34`)
-12. Trial warning operational handling (`7.35`)
-13. Finalization-failed immediate free-tier enforcement (`7.36`)
-14. `invoice.created` fast-ack behavior (`7.31`)
-15. Duplicate webhook idempotency (`7.14`)
-16. Crash-safe lease reclaim (`7.20`)
-17. Catalog sync and drift checks (`7.22`, `7.23`)
-18. Customer mapping recovery checks (`7.25`, `7.26`, `7.27`, `7.28`)
-19. Stale-event watermark guard (`7.37`)
-20. Reconciliation drift repair (`7.38`)
+2. Workspace billing summary checks (`7.0`)
+3. Checkout success on free workspace (`7.1`)
+4. Checkout idempotency replay/expiry suite (`7.17`, `7.18`, `7.19`)
+5. Complete checkout on Stripe-hosted page
+6. Verify webhook + subscription sync (`7.9`)
+7. Re-call checkout for paid workspace (`7.5`)
+8. Portal session success (`7.6`)
+9. Payment failed/recovery (`7.11`, `7.12`)
+10. Payment-action-required grace behavior (`7.32`)
+11. Pending status lifecycle checks (`7.29`, `7.30`)
+12. Pause/resume entitlement lifecycle (`7.33`, `7.34`)
+13. Trial warning operational handling (`7.35`)
+14. Finalization-failed immediate free-tier enforcement (`7.36`)
+15. `invoice.created` fast-ack behavior (`7.31`)
+16. Duplicate webhook idempotency (`7.14`)
+17. Crash-safe lease reclaim (`7.20`)
+18. Catalog sync and drift checks (`7.22`, `7.23`)
+19. Customer mapping recovery checks (`7.25`, `7.26`, `7.26B`, `7.27`, `7.28`)
+20. Stale-event watermark guard (`7.37`)
+21. Reconciliation drift repair (`7.38`)
 
 Pass criteria:
 1. Success-path requests return expected `200`.

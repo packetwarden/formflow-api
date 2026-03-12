@@ -139,6 +139,81 @@ export interface WorkspaceSettingsResponse {
     settings: WorkspaceSettingsV1
 }
 
+export type WorkspaceBillingStatus =
+    | 'trialing'
+    | 'active'
+    | 'past_due'
+    | 'canceled'
+    | 'unpaid'
+    | 'paused'
+    | 'incomplete'
+    | 'incomplete_expired'
+
+export type WorkspaceBillingInterval = 'monthly' | 'yearly'
+
+export interface WorkspaceBillingSubscriptionSummary {
+    id: string
+    status: WorkspaceBillingStatus
+    is_entitled: boolean
+    plan_slug: WorkspacePlanSlug
+    plan_name: string
+    interval: WorkspaceBillingInterval
+    amount_cents: number
+    currency: string
+    current_period_start: string
+    current_period_end: string
+    trial_start: string | null
+    trial_end: string | null
+    cancel_at_period_end: boolean
+    grace_period_end: string | null
+    downgrade_to_plan_slug: WorkspacePlanSlug | null
+}
+
+export interface WorkspaceBillingHistorySummary {
+    provider: 'stripe_portal'
+    available: boolean
+}
+
+export interface WorkspaceBillingCheckoutOption {
+    plan_slug: 'pro' | 'business'
+    plan_name: string
+    interval: WorkspaceBillingInterval
+    amount_cents: number
+    currency: string
+    trial_period_days: number
+}
+
+export interface WorkspaceBillingPortalAction {
+    method: 'POST'
+    path: string
+}
+
+export interface WorkspaceBillingCheckoutAction {
+    method: 'POST'
+    path: string
+    requires_idempotency_key: true
+    available_plans: WorkspaceBillingCheckoutOption[]
+}
+
+export interface WorkspaceBillingActionSummary {
+    can_manage_billing: boolean
+    portal_session: WorkspaceBillingPortalAction | null
+    checkout_session: WorkspaceBillingCheckoutAction | null
+}
+
+export interface WorkspaceBillingResponse {
+    workspace: {
+        id: string
+        role: WorkspaceRoleSummary
+    }
+    billing: {
+        effective_plan: WorkspacePlanSlug
+        subscription: WorkspaceBillingSubscriptionSummary | null
+        history: WorkspaceBillingHistorySummary
+        actions: WorkspaceBillingActionSummary
+    }
+}
+
 export interface UpdateWorkspaceSettingsInput {
     version: number
     name?: string

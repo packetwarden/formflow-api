@@ -6,9 +6,15 @@ import type {
     AuthBootstrapWorkspace,
     Env,
     Variables,
+    WorkspaceBillingActionSummary,
+    WorkspaceBillingCheckoutOption,
+    WorkspaceBillingResponse,
+    WorkspaceBillingStatus,
+    WorkspaceBillingSubscriptionSummary,
     WorkspaceMembershipSummary,
     WorkspaceOverviewResponse,
     WorkspaceOwnerSummary,
+    WorkspacePlanSlug,
     WorkspaceRoleSummary,
     WorkspaceSettingsResponse,
     WorkspaceSettingsV1,
@@ -61,7 +67,56 @@ type WorkspaceMemberCountRow = {
     workspace_id: string
 }
 
+type WorkspaceBillingPlanRow = {
+    slug: string
+    name: string
+}
+
+type WorkspaceBillingPlanWithSortRow = WorkspaceBillingPlanRow & {
+    sort_order: number
+}
+
+type WorkspaceBillingVariantRow = {
+    interval: string
+    amount_cents: number
+    currency: string
+}
+
+type WorkspaceBillingSubscriptionRow = {
+    id: string
+    status: string
+    stripe_customer_id: string | null
+    current_period_start: string
+    current_period_end: string
+    trial_start: string | null
+    trial_end: string | null
+    cancel_at_period_end: boolean
+    grace_period_end: string | null
+    created_at: string
+    last_stripe_event_created_at: string | null
+    plan: WorkspaceBillingPlanRow | WorkspaceBillingPlanRow[] | null
+    variant: WorkspaceBillingVariantRow | WorkspaceBillingVariantRow[] | null
+    downgrade_plan: Pick<WorkspaceBillingPlanRow, 'slug'> | Pick<WorkspaceBillingPlanRow, 'slug'>[] | null
+}
+
+type WorkspaceBillingCheckoutVariantRow = {
+    interval: string
+    amount_cents: number
+    currency: string
+    trial_period_days: number
+    stripe_price_id: string | null
+    plan: WorkspaceBillingPlanWithSortRow | WorkspaceBillingPlanWithSortRow[] | null
+}
+
+type NormalizedWorkspaceBillingSubscription = WorkspaceBillingSubscriptionSummary & {
+    created_at: string
+    last_stripe_event_created_at: string | null
+    stripe_customer_id: string | null
+}
+
 type OwnerProfileRow = WorkspaceOwnerSummary
+
+const ENTITLED_BILLING_STATUSES = new Set<WorkspaceBillingStatus>(['active', 'trialing', 'past_due'])
 
 const normalizeWorkspaceRole = (role: string): WorkspaceRole | null => {
     if (role === 'owner' || role === 'admin' || role === 'editor' || role === 'viewer') {
@@ -69,6 +124,44 @@ const normalizeWorkspaceRole = (role: string): WorkspaceRole | null => {
     }
 
     return null
+}
+
+const normalizeWorkspacePlanSlug = (plan: string): WorkspacePlanSlug | null => {
+    if (plan === 'free' || plan === 'pro' || plan === 'business' || plan === 'enterprise') {
+        return plan
+    }
+
+    return null
+}
+
+const normalizeWorkspaceBillingStatus = (status: string): WorkspaceBillingStatus | null => {
+    if (
+        status === 'trialing'
+        || status === 'active'
+        || status === 'past_due'
+        || status === 'canceled'
+        || status === 'unpaid'
+        || status === 'paused'
+        || status === 'incomplete'
+        || status === 'incomplete_expired'
+    ) {
+        return status
+    }
+
+    return null
+}
+
+const normalizeWorkspaceBillingInterval = (interval: string): 'monthly' | 'yearly' | null => {
+    if (interval === 'monthly' || interval === 'yearly') {
+        return interval
+    }
+
+    return null
+}
+
+const unwrapJoinedRow = <T>(value: T | T[] | null | undefined): T | null => {
+    if (Array.isArray(value)) return value[0] ?? null
+    return value ?? null
 }
 
 const sortBootstrapWorkspaces = (left: AuthBootstrapWorkspace, right: AuthBootstrapWorkspace) => {
@@ -81,6 +174,31 @@ const sortBootstrapWorkspaces = (left: AuthBootstrapWorkspace, right: AuthBootst
     }
 
     return left.id.localeCompare(right.id)
+}
+
+const compareIsoDesc = (left: string, right: string) => right.localeCompare(left)
+
+const compareNullableIsoDesc = (left: string | null, right: string | null) => {
+    if (left === right) return 0
+    if (!left) return 1
+    if (!right) return -1
+    return right.localeCompare(left)
+}
+
+const compareWorkspaceBillingSubscriptionRows = (
+    left: NormalizedWorkspaceBillingSubscription,
+    right: NormalizedWorkspaceBillingSubscription
+) => {
+    const byEventCreatedAt = compareNullableIsoDesc(
+        left.last_stripe_event_created_at,
+        right.last_stripe_event_created_at
+    )
+    if (byEventCreatedAt !== 0) return byEventCreatedAt
+
+    const byCreatedAt = compareIsoDesc(left.created_at, right.created_at)
+    if (byCreatedAt !== 0) return byCreatedAt
+
+    return right.id.localeCompare(left.id)
 }
 
 const mergeDefinedValues = <T extends object>(current: T | undefined, patch: T | undefined): T | undefined => {
@@ -126,6 +244,45 @@ const toWorkspaceMembershipSummary = (
     is_owner: role === 'owner',
     can_edit_settings: role === 'owner',
 })
+
+const normalizeWorkspaceBillingSubscription = (
+    row: WorkspaceBillingSubscriptionRow
+): NormalizedWorkspaceBillingSubscription | null => {
+    const status = normalizeWorkspaceBillingStatus(row.status)
+    const plan = unwrapJoinedRow(row.plan)
+    const variant = unwrapJoinedRow(row.variant)
+    const downgradePlan = unwrapJoinedRow(row.downgrade_plan)
+    const planSlug = plan ? normalizeWorkspacePlanSlug(plan.slug) : null
+    const interval = variant ? normalizeWorkspaceBillingInterval(variant.interval) : null
+    const downgradePlanSlug = downgradePlan ? normalizeWorkspacePlanSlug(downgradePlan.slug) : null
+
+    if (!status || !plan || !variant || !planSlug || !interval) {
+        return null
+    }
+
+    return {
+        id: row.id,
+        status,
+        is_entitled: ENTITLED_BILLING_STATUSES.has(status),
+        plan_slug: planSlug,
+        plan_name: plan.name,
+        interval,
+        amount_cents: variant.amount_cents,
+        currency: variant.currency,
+        current_period_start: row.current_period_start,
+        current_period_end: row.current_period_end,
+        trial_start: row.trial_start,
+        trial_end: row.trial_end,
+        cancel_at_period_end: row.cancel_at_period_end,
+        grace_period_end: row.grace_period_end,
+        downgrade_to_plan_slug: downgradePlanSlug,
+        created_at: row.created_at,
+        last_stripe_event_created_at: row.last_stripe_event_created_at,
+        stripe_customer_id: row.stripe_customer_id,
+    }
+}
+
+const checkoutIntervalOrder = (interval: 'monthly' | 'yearly') => (interval === 'monthly' ? 0 : 1)
 
 const loadWorkspaceRecord = async (c: AppContext, workspaceId: string) => {
     const supabase = getAuthScopedSupabaseClient(c)
@@ -252,6 +409,180 @@ export const loadWorkspaceSettingsDocument = async (c: AppContext, workspaceId: 
     }
 
     return { ok: true as const, settings: response }
+}
+
+export const loadWorkspaceBillingSummary = async (c: AppContext, workspaceId: string) => {
+    const roleResult = await resolveWorkspaceRole(c, workspaceId)
+    if (!roleResult.ok) return roleResult
+
+    const supabase = getAuthScopedSupabaseClient(c)
+    const { data: subscriptionRows, error: subscriptionError } = await supabase
+        .from('subscriptions')
+        .select(`
+            id,
+            status,
+            stripe_customer_id,
+            current_period_start,
+            current_period_end,
+            trial_start,
+            trial_end,
+            cancel_at_period_end,
+            grace_period_end,
+            created_at,
+            last_stripe_event_created_at,
+            plan:plans!subscriptions_plan_id_fkey(slug, name),
+            variant:plan_variants!subscriptions_plan_variant_id_fkey(interval, amount_cents, currency),
+            downgrade_plan:plans!subscriptions_downgrade_to_plan_id_fkey(slug)
+        `)
+        .eq('workspace_id', workspaceId)
+        .returns<WorkspaceBillingSubscriptionRow[]>()
+
+    if (subscriptionError) {
+        console.error('Workspace billing subscription load error:', {
+            workspace_id: workspaceId,
+            error: subscriptionError,
+        })
+        return { ok: false as const, response: c.json({ error: 'Failed to load workspace billing' }, 500) }
+    }
+
+    const normalizedSubscriptions: NormalizedWorkspaceBillingSubscription[] = []
+    for (const row of subscriptionRows ?? []) {
+        const normalized = normalizeWorkspaceBillingSubscription(row)
+        if (!normalized) {
+            console.error('Workspace billing subscription row normalization failed:', {
+                workspace_id: workspaceId,
+                subscription_id: row.id,
+            })
+            return { ok: false as const, response: c.json({ error: 'Failed to load workspace billing' }, 500) }
+        }
+
+        normalizedSubscriptions.push(normalized)
+    }
+
+    const sortedSubscriptions = [...normalizedSubscriptions].sort(compareWorkspaceBillingSubscriptionRows)
+    const entitledSubscription = sortedSubscriptions.find((row) => row.is_entitled) ?? null
+    const relevantSubscription = entitledSubscription ?? sortedSubscriptions[0] ?? null
+    const effectivePlan = entitledSubscription?.plan_slug ?? 'free'
+    const historyAvailable = normalizedSubscriptions.some((row) => row.stripe_customer_id !== null)
+    const canManageBilling = hasRequiredWorkspaceRole(roleResult.role, 'admin')
+
+    let checkoutOptions: WorkspaceBillingCheckoutOption[] = []
+
+    if (canManageBilling && effectivePlan === 'free') {
+        const { data: checkoutVariantRows, error: checkoutVariantError } = await supabase
+            .from('plan_variants')
+            .select(`
+                interval,
+                amount_cents,
+                currency,
+                trial_period_days,
+                stripe_price_id,
+                plan:plans!plan_variants_plan_id_fkey(slug, name, sort_order)
+            `)
+            .eq('is_active', true)
+            .not('stripe_price_id', 'is', null)
+            .returns<WorkspaceBillingCheckoutVariantRow[]>()
+
+        if (checkoutVariantError) {
+            console.error('Workspace billing checkout options load error:', {
+                workspace_id: workspaceId,
+                error: checkoutVariantError,
+            })
+            return { ok: false as const, response: c.json({ error: 'Failed to load workspace billing' }, 500) }
+        }
+
+        const sortableCheckoutOptions: Array<WorkspaceBillingCheckoutOption & { sort_order: number }> = []
+
+        for (const row of checkoutVariantRows ?? []) {
+            const plan = unwrapJoinedRow(row.plan)
+            const planSlug = plan ? normalizeWorkspacePlanSlug(plan.slug) : null
+            const interval = normalizeWorkspaceBillingInterval(row.interval)
+
+            if (planSlug !== 'pro' && planSlug !== 'business') {
+                continue
+            }
+
+            if (!plan || !interval || !row.stripe_price_id) {
+                console.error('Workspace billing checkout option normalization failed:', {
+                    workspace_id: workspaceId,
+                    plan_slug: plan?.slug ?? null,
+                    interval: row.interval,
+                })
+                return { ok: false as const, response: c.json({ error: 'Failed to load workspace billing' }, 500) }
+            }
+
+            sortableCheckoutOptions.push({
+                plan_slug: planSlug,
+                plan_name: plan.name,
+                interval,
+                amount_cents: row.amount_cents,
+                currency: row.currency,
+                trial_period_days: row.trial_period_days,
+                sort_order: plan.sort_order,
+            })
+        }
+
+        checkoutOptions = sortableCheckoutOptions
+            .sort((left, right) => {
+                if (left.sort_order !== right.sort_order) return left.sort_order - right.sort_order
+                return checkoutIntervalOrder(left.interval) - checkoutIntervalOrder(right.interval)
+            })
+            .map(({ sort_order: _sortOrder, ...option }) => option)
+    }
+
+    const actions: WorkspaceBillingActionSummary = {
+        can_manage_billing: canManageBilling,
+        portal_session: canManageBilling && historyAvailable
+            ? {
+                method: 'POST',
+                path: `/api/v1/stripe/workspaces/${workspaceId}/portal-session`,
+            }
+            : null,
+        checkout_session: canManageBilling && effectivePlan === 'free' && checkoutOptions.length > 0
+            ? {
+                method: 'POST',
+                path: `/api/v1/stripe/workspaces/${workspaceId}/checkout-session`,
+                requires_idempotency_key: true,
+                available_plans: checkoutOptions,
+            }
+            : null,
+    }
+
+    const response: WorkspaceBillingResponse = {
+        workspace: {
+            id: workspaceId,
+            role: roleResult.role,
+        },
+        billing: {
+            effective_plan: effectivePlan,
+            subscription: relevantSubscription
+                ? {
+                    id: relevantSubscription.id,
+                    status: relevantSubscription.status,
+                    is_entitled: relevantSubscription.is_entitled,
+                    plan_slug: relevantSubscription.plan_slug,
+                    plan_name: relevantSubscription.plan_name,
+                    interval: relevantSubscription.interval,
+                    amount_cents: relevantSubscription.amount_cents,
+                    currency: relevantSubscription.currency,
+                    current_period_start: relevantSubscription.current_period_start,
+                    current_period_end: relevantSubscription.current_period_end,
+                    trial_start: relevantSubscription.trial_start,
+                    trial_end: relevantSubscription.trial_end,
+                    cancel_at_period_end: relevantSubscription.cancel_at_period_end,
+                    grace_period_end: relevantSubscription.grace_period_end,
+                    downgrade_to_plan_slug: relevantSubscription.downgrade_to_plan_slug,
+                }
+                : null,
+            history: {
+                provider: 'stripe_portal',
+                available: historyAvailable,
+            },
+            actions,
+        },
+    }
+
+    return { ok: true as const, billing: response }
 }
 
 export const loadWorkspaceBootstrap = async (c: AppContext) => {

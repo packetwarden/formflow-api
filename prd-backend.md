@@ -44,6 +44,7 @@ We utilize a RESTful design optimized through Hono's `app.route()` grouping feat
 | **GET** | `/api/v1/auth/me` | Fetch the current authenticated user's profile. | Yes (Bearer) |
 | **Workspace Group (`/api/v1/workspaces/:workspaceId/*`)** |  |  |  |
 | **GET** | `/api/v1/workspaces/:workspaceId/overview` | Fetch member-visible workspace summary, owner details, caller role, and safe workspace settings. | Yes (Bearer) |
+| **GET** | `/api/v1/workspaces/:workspaceId/billing` | Fetch member-visible billing summary, effective plan, current subscription snapshot, and Stripe management action descriptors. | Yes (Bearer) |
 | **GET** | `/api/v1/workspaces/:workspaceId/settings` | Fetch owner-only editable workspace settings document with optimistic-lock version. | Yes (Bearer, owner only) |
 | **PATCH** | `/api/v1/workspaces/:workspaceId/settings` | Update owner-only workspace metadata and typed settings namespaces using optimistic locking. | Yes (Bearer, owner only) |
 | **Builder Group (`/api/v1/build/:workspaceId/*`)** |  |  |  |
